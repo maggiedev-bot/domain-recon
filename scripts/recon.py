@@ -30,7 +30,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 USER_AGENT = "domain-recon/{v} (+https://github.com/maggiedev-bot/domain-recon)".format(v=__version__)
 
@@ -1065,6 +1065,8 @@ def run_profile(
     timeout: float = 20.0,
     retries: int = 3,
     pause: "float | None" = None,
+    wayback_timeout: float = 8.0,
+    wayback_retries: int = 0,
 ) -> dict:
     """Chain certs -> rdap -> dns -> resolve -> ip/asn -> wayback into one report.
 
@@ -1132,11 +1134,16 @@ def run_profile(
         hosts[ip] = {"ip": info, "asn": asn}
 
     # 6. Wayback summary on the apex + a couple high-value subdomains.
+    #    This is the lowest-value / slowest step: the Wayback CDX index is
+    #    frequently slow (single-target lookups seen in the tens of seconds),
+    #    so it runs on a deliberately tight budget (short timeout, no retries).
+    #    A slow archive.org must never make the orchestrator read as hung; a
+    #    timed-out Wayback lookup is fault-isolated into `errors` like any other.
     wayback = []
     if do_wayback:
         wb_targets = [apex] + [s for s in resolve_targets if s != apex][:wayback_subs]
         for t in wb_targets:
-            r = step("wayback:{}".format(t), lambda t=t: fetch_wayback(t, cdx=True, cdx_limit=5, timeout=timeout, retries=retries))
+            r = step("wayback:{}".format(t), lambda t=t: fetch_wayback(t, cdx=True, cdx_limit=5, timeout=wayback_timeout, retries=wayback_retries))
             if r:
                 wayback.append(r)
 

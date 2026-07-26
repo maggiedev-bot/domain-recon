@@ -650,6 +650,23 @@ class TestProfile:
         assert len(rep["hosts"]) == 3
         assert sleeps == [1.5, 1.5]
 
+    def test_wayback_step_runs_on_bounded_budget(self, monkeypatch):
+        # The Wayback CDX index is the slowest source; the profile must call it
+        # with a tight timeout and no retries so a slow archive.org can never
+        # make the orchestrator read as hung. Capture the kwargs it passes.
+        resolve_map = {"www.example.com": {"A": ["93.184.216.34"], "AAAA": []}}
+        _install_profile_fakes(monkeypatch, resolve_map)
+        seen = []
+        monkeypatch.setattr(
+            recon, "fetch_wayback",
+            lambda t, **k: seen.append(k) or {"source": "wayback", "url": t, "archived": False, "cdx": {}},
+        )
+        recon.run_profile("example.com")
+        assert seen, "profile should invoke the wayback step"
+        for k in seen:
+            assert k["timeout"] <= 8.0
+            assert k["retries"] <= 1
+
     def test_human_render_profile(self, monkeypatch, capsys):
         resolve_map = {"www.example.com": {"A": ["93.184.216.34"], "AAAA": []}}
         _install_profile_fakes(monkeypatch, resolve_map)

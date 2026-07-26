@@ -1,7 +1,7 @@
 ---
 name: domain-recon
 description: Passive domain/infra OSINT over five keyless public APIs — subdomains, RDAP/WHOIS, DNS-over-HTTPS, IP geo/ISP, and ASN/prefix ownership.
-metadata: {"openclaw": {"requires": {"bins": ["python3"]}, "emoji": "🛰️"}, "homepage": "https://github.com/maggiedev-bot/domain-recon", "version": "0.3.0"}
+metadata: {"openclaw": {"requires": {"bins": ["python3"]}, "emoji": "🛰️"}, "homepage": "https://github.com/maggiedev-bot/domain-recon", "version": "0.3.1"}
 ---
 
 # domain-recon
@@ -104,6 +104,14 @@ returns one merged JSON/`--human` report.
   **supplement** for TLDs IANA omits but that still run RDAP (e.g. `.io`, which
   the rdap.org redirector `404`s), then falls back to rdap.org for anything else.
   The winning source is recorded in `rdap_source`.
+- **`profile` runtime is bounded, not instant.** A full profile fans out across
+  ~6 sources and multiple hosts with courtesy rate-limit spacing, so a large
+  domain (dozens of subdomains) takes roughly **1–1.5 min** — it is working, not
+  hung. The slowest source, the Wayback CDX index (single lookups seen in the
+  tens of seconds), runs on a deliberately tight budget (short timeout, no
+  retry) so it can never dominate; a timed-out archive lookup is fault-isolated
+  into `errors[]` like any other. Use `--no-wayback` or a lower `--ip-limit` to
+  make a profile faster.
 - **Exit codes:** `0` success, `2` on a handled error (bad input, upstream
   failure) with a message on stderr.
 

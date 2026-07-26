@@ -1,5 +1,27 @@
 # Changelog / Design decisions — domain-recon
 
+## 0.3.1 — bound the Wayback step so `profile` can't read as hung
+
+Live QA (2026-07-26) ran the full surface against `groupvault.io` and
+`kraken.com`. Both round-3 fixes (CT fallback + IANA/supplement RDAP bootstrap)
+fired correctly on real infra, but the `profile` orchestrator on a large domain
+(`kraken.com`, 90 subdomains) repeatedly ran **past 2 minutes** — long enough to
+read as a hang.
+
+### Fixed
+- **`profile` now bounds the Wayback CDX step** (`run_profile` gains
+  `wayback_timeout=8.0`, `wayback_retries=0`). Root cause: the profile passed its
+  full `timeout=20, retries=3` budget to the Wayback step, and the Wayback CDX
+  index is by far the slowest source (a single subdomain lookup was measured at
+  **38 s**), so three archive targets could consume several minutes on their own.
+  Wayback is the lowest-value part of a profile and is already fault-isolated, so
+  it now runs on a tight single-attempt budget. Measured effect on `kraken.com`:
+  **>120 s → ~78 s**; `groupvault.io` ~92 s, both completing cleanly (exit `0`).
+  Documented the expected 1–1.5 min profile runtime in SKILL.md so it doesn't
+  read as hung; `--no-wayback` / `--ip-limit` remain available to go faster.
+- Regression test `test_wayback_step_runs_on_bounded_budget` locks the tight
+  budget (offline suite 116 → 117 tests, all green).
+
 ## 0.3.0 — source-outage resilience
 
 Both changes were driven by a live run that hit two real upstream failures at
