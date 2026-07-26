@@ -70,14 +70,55 @@ crt.sh — example.com
 > with backoff; if it is temporarily down you'll get a clean `error:` on stderr
 > and a non-zero exit, not a crash.
 
-## `wayback example.com`
+## `wayback example.com --cdx-limit 3`   (availability fast-path + CDX history)
 ```json
 {
   "archived": true,
   "snapshot_url": "http://web.archive.org/web/20260726083637/http://example.com/",
-  "source": "wayback",
-  "status": "200",
   "timestamp": "20260726083637",
+  "status": "200",
+  "cdx": {
+    "first_capture": {
+      "timestamp": "20020120142510",
+      "original": "http://example.com:80/",
+      "statuscode": "200",
+      "snapshot_url": "http://web.archive.org/web/20020120142510/http://example.com:80/"
+    },
+    "last_capture": {
+      "timestamp": "20260726083637",
+      "original": "http://example.com/",
+      "statuscode": "200",
+      "snapshot_url": "http://web.archive.org/web/20260726083637/http://example.com/"
+    },
+    "recent": [ "... up to --cdx-limit most-recent captures ..." ]
+  },
+  "source": "wayback",
   "url": "example.com"
 }
 ```
+> The availability endpoint and the CDX index are independent; when availability
+> is momentarily empty the CDX history still surfaces the capture record.
+
+## `profile example.com --human`   (orchestrate every source into one report)
+```
+profile — example.com
+  registration: 1995-08-14T04:00:00Z
+  nameservers: elliott.ns.cloudflare.com, hera.ns.cloudflare.com
+  dns:
+    A     104.20.23.154, 172.66.147.243
+    AAAA  2606:4700:10::ac42:93f3, 2606:4700:10::6814:179a
+    MX    0 .
+    NS    elliott.ns.cloudflare.com., hera.ns.cloudflare.com.
+  subdomains: 0
+  hosts:
+    104.20.23.154 — AS13335 Cloudflare, Inc. [Canada / Toronto]
+    172.66.147.243 — AS13335 Cloudflare, Inc. [Canada / Toronto]
+  Wayback — example.com
+    first capture: 20020120142510
+    last capture:  20260726083637
+  errors (1):
+    certs: HTTP 404 from https://crt.sh/?q=%25.example.com&output=json
+```
+> Note the `errors` block: crt.sh was momentarily unavailable, but `profile`
+> **isolates the failure** — it records the failed step and still returns every
+> other source rather than aborting the whole report.

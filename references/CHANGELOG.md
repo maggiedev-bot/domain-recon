@@ -1,5 +1,33 @@
 # Changelog / Design decisions — domain-recon
 
+## 0.2.0 — orchestration, archive history, hardening
+
+### Added
+- **`profile` subcommand** — a one-shot orchestrator that chains `certs → dns →
+  ip → asn → wayback` for a domain into a single merged report. Deduplicates
+  resolved IPs, isolates per-source failures (records them under `errors[]`
+  instead of aborting), bounds each stage (`--cert-limit`/`--resolve-limit`/
+  `--ip-limit`), and spaces `ip` enrichment calls to respect ip-api's 45/min.
+- **Wayback CDX capture history** (`wayback`) — beyond the availability
+  fast-path, the command now lists recent captures from the CDX API
+  (`web.archive.org/cdx/search/cdx`), with `--cdx-limit`, optional `--cdx-count`
+  (active-months scan), and `--no-cdx` to skip.
+- **`certs` hardening** — `--limit` / `--max-certs` to cap subdomain and
+  cert-history output on busy domains (full counts still reported), and richer
+  per-cert fields (issuer, common name, validity window, serial, entry time).
+
+### Docs
+- Consolidated **"Rate limits & gotchas"** section in `API_NOTES.md` (crt.sh
+  flakiness, ip-api HTTP-only + non-commercial free tier, RIPEstat prefix cost,
+  CDX scan cost).
+- `homepage` moved to `github.com/maggiedev-bot/domain-recon`; `metadata` block
+  normalized (single-line JSON, `version`).
+
+### Tests
+- Offline suite expanded to **92 deterministic tests** (added profile
+  orchestration: wiring/dedup, fault isolation, per-source failure, ip-limit
+  truncation, rate-limit spacing, human render; plus CDX parse/fetch paths).
+
 ## 0.1.0 — initial build
 
 ### Sources
