@@ -1,0 +1,804 @@
+"""Offline, deterministic tests for the domain-recon helper.
+
+These NEVER hit the network. Every source is exercised against the captured
+fixtures in tests/fixtures/, with the HTTP layer either patched at the
+`http_get_json` seam (parse/normalize behavior) or at the lower `_open` seam
+(retry / backoff / failure-mode behavior).
+"""
+import email.message
+import io
+import socket
+import urllib.error
+
+import pytest
+
+import recon
+from conftest import load_fixture, load_fixture_text
+
+
+# ---------------------------------------------------------------------------
+# Test doubles for the HTTP layer
+# ---------------------------------------------------------------------------
+
+
+class FakeResp:
+    """Minimal stand-in for an http.client.HTTPResponse."""
+
+    def __init__(self, body, content_type="application/json; charset=utf-8"):
+        self._body = body if isinstance(body, bytes) else body.encode("utf-8")
+        self.headers = email.message.Message()
+        self.headers["Content-Type"] = content_type
+
+    def read(self):
+        return self._body
+
+
+def make_http_error(code, retry_after=None, body=b""):
+    hdrs = email.message.Message()
+    if retry_after is not None:
+        hdrs["Retry-After"] = str(retry_after)
+    return urllib.error.HTTPError("http://x", code, "err", hdrs, io.BytesIO(body))
+
+
+@pytest.fixture(autouse=True)
+def _no_sleep(monkeypatch):
+    """Never actually sleep during retry/backoff tests."""
+    monkeypatch.setattr(recon, "_sleep", lambda *_a, **_k: None)
+
+
+def patch_json(monkeypatch, mapping_or_value):
+    """Patch http_get_json. If given a dict, dispatch by substring in the URL."""
+
+    def fake(url, headers=None, timeout=15.0, retries=3):
+        if isinstance(mapping_or_value, dict) and not _looks_like_payload(mapping_or_value):
+            for key, val in mapping_or_value.items():
+                if key in url:
+                    return val
+            raise AssertionError("no fixture mapped for URL: {}".format(url))
+        return mapping_or_value
+
+    monkeypatch.setattr(recon, "http_get_json", fake)
+
+
+def _looks_like_payload(d):
+    # A RIPEstat/RDAP payload dict has these hallmark keys; a URL->fixture
+    # dispatch map won't.
+    return any(k in d for k in ("data", "objectClassName", "Status", "archived_snapshots", "status"))
+
+
+# ---------------------------------------------------------------------------
+# Input validation / normalization
+# ---------------------------------------------------------------------------
+
+
+class TestNormalize:
+    def test_domain_lowercases_and_strips_trailing_dot(self):
+        assert recon.normalize_domain("Example.COM.") == "example.com"
+
+    def test_domain_idn_punycode(self):
+        # bücher.example -> xn--bcher-kva.example
+        assert recon.normalize_domain("bücher.example") == "xn--bcher-kva.example"
+
+    def test_domain_already_punycode_passthrough(self):
+        assert recon.normalize_domain("xn--bcher-kva.example") == "xn--bcher-kva.example"
+
+    @pytest.mark.parametrize("bad", ["", "   ", "localhost", "no spaces.com com", "a/b.com", "..com"])
+    def test_domain_rejects_junk(self, bad):
+        with pytest.raises(recon.InputError):
+            recon.normalize_domain(bad)
+
+    def test_ip_v4_roundtrip(self):
+        assert recon.normalize_ip("8.8.8.8") == "8.8.8.8"
+
+    def test_ip_v6_canonicalized(self):
+        assert recon.normalize_ip("2606:4700:10::6814:179A") == "2606:4700:10::6814:179a"
+
+    def test_ip_rejects_bad(self):
+        with pytest.raises(recon.InputError):
+            recon.normalize_ip("999.1.1.1")
+
+    @pytest.mark.parametrize("val,expected", [("AS15169", 15169), ("as15169", 15169), ("15169", 15169)])
+    def test_asn_forms(self, val, expected):
+        assert recon.normalize_asn(val) == expected
+
+    def test_asn_rejects_bad(self):
+        with pytest.raises(recon.InputError):
+            recon.normalize_asn("AS-bogus")
+
+    @pytest.mark.parametrize(
+        "val,kind",
+        [("8.8.8.8", "ip"), ("2606:4700:10::1", "ip"), ("AS15169", "asn"), ("15169", "asn"), ("example.com", "domain")],
+    )
+    def test_classify_resource(self, val, kind):
+        assert recon.classify_resource(val) == kind
+
+
+# ---------------------------------------------------------------------------
+# crt.sh
+# ---------------------------------------------------------------------------
+
+
+class TestCerts:
+    def test_parse_dedup_and_sorted(self):
+        entries = load_fixture("crtsh_example.json")
+        res = recon.parse_certs(entries, "example.com")
+        assert res["source"] == "crt.sh"
+        # subdomains are unique and sorted despite duplicate name_value rows.
+        assert res["subdomains"] == sorted(set(res["subdomains"]))
+        assert res["subdomain_count"] == len(res["subdomains"])
+        assert "example.com" in res["subdomains"]
+        assert res["cert_count"] == len(entries)
+
+    def test_wildcard_included_by_default(self):
+        entries = load_fixture("crtsh_example.json")
+        res = recon.parse_certs(entries, "example.com", include_wildcards=True)
+        assert any(s.startswith("*.") for s in res["subdomains"])
+
+    def test_wildcard_excluded_when_asked(self):
+        entries = load_fixture("crtsh_example.json")
+        res = recon.parse_certs(entries, "example.com", include_wildcards=False)
+        assert all(not s.startswith("*.") for s in res["subdomains"])
+
+    def test_wildcard_synthetic_entry(self):
+        entries = [{"name_value": "*.sub.example.com\nsub.example.com", "common_name": "*.sub.example.com"}]
+        res = recon.parse_certs(entries, "example.com")
+        assert "*.sub.example.com" in res["subdomains"]
+        assert "sub.example.com" in res["subdomains"]
+
+    def test_excludes_out_of_scope_names(self):
+        entries = [{"name_value": "a.example.com\nevil.attacker.test", "common_name": "a.example.com"}]
+        res = recon.parse_certs(entries, "example.com")
+        assert "a.example.com" in res["subdomains"]
+        assert "evil.attacker.test" not in res["subdomains"]
+
+    def test_empty_result(self):
+        res = recon.parse_certs([], "example.com")
+        assert res["subdomain_count"] == 0
+        assert res["cert_count"] == 0
+
+    def test_limit_caps_subdomains_but_keeps_full_count(self):
+        entries = load_fixture("crtsh_example.json")
+        full = recon.parse_certs(entries, "example.com")
+        assert full["subdomain_count"] >= 2  # fixture has multiple unique names
+        capped = recon.parse_certs(entries, "example.com", limit=1)
+        assert len(capped["subdomains"]) == 1
+        assert capped["subdomain_count"] == full["subdomain_count"]  # true total preserved
+        assert capped["subdomains_truncated"] is True
+        # the returned set is the first N of the sorted full set (deterministic)
+        assert capped["subdomains"] == full["subdomains"][:1]
+
+    def test_no_limit_not_truncated(self):
+        entries = load_fixture("crtsh_example.json")
+        res = recon.parse_certs(entries, "example.com")
+        assert res["subdomains_truncated"] is False
+        assert res["certs_truncated"] is False
+        assert res["target"] == "example.com"
+
+    def test_max_certs_caps_history(self):
+        entries = load_fixture("crtsh_example.json")
+        res = recon.parse_certs(entries, "example.com", max_certs=3)
+        assert len(res["certs"]) == 3
+        assert res["cert_count"] == len(entries)  # full count preserved
+        assert res["certs_truncated"] is True
+
+    def test_none_result(self):
+        res = recon.parse_certs(None, "example.com")
+        assert res["subdomains"] == []
+
+    def test_parse_rejects_non_list(self):
+        with pytest.raises(recon.ParseError):
+            recon.parse_certs({"not": "a list"}, "example.com")
+
+    def test_fetch_empty_body_is_empty_result(self, monkeypatch):
+        # crt.sh returns an empty body for zero results -> must not blow up.
+        monkeypatch.setattr(recon, "http_get", lambda *a, **k: "")
+        res = recon.fetch_certs("example.com")
+        assert res["subdomain_count"] == 0
+
+    def test_fetch_end_to_end(self, monkeypatch):
+        text = load_fixture_text("crtsh_example.json")
+        monkeypatch.setattr(recon, "http_get", lambda *a, **k: text)
+        res = recon.fetch_certs("example.com")
+        assert res["cert_count"] == 12
+
+
+# ---------------------------------------------------------------------------
+# RDAP
+# ---------------------------------------------------------------------------
+
+
+class TestRdap:
+    def test_domain_parse(self):
+        obj = load_fixture("rdap_domain_example.json")
+        res = recon.parse_rdap(obj, "domain")
+        assert res["ldhName"] == "EXAMPLE.COM"
+        assert res["nameservers"] == sorted(res["nameservers"])
+        assert "registration" in res["events"]
+        assert isinstance(res["status"], list)
+
+    def test_ip_parse(self):
+        obj = load_fixture("rdap_ip_8888.json")
+        res = recon.parse_rdap(obj, "ip")
+        assert res["startAddress"] == "8.8.8.0"
+        assert res["endAddress"] == "8.8.8.255"
+
+    def test_asn_parse(self):
+        obj = load_fixture("rdap_asn_15169.json")
+        res = recon.parse_rdap(obj, "asn")
+        assert res["startAutnum"] == 15169
+
+    def test_parse_rejects_non_dict(self):
+        with pytest.raises(recon.ParseError):
+            recon.parse_rdap([1, 2, 3], "domain")
+
+    def test_fetch_autodetects_ip(self, monkeypatch):
+        obj = load_fixture("rdap_ip_8888.json")
+        captured = {}
+
+        def fake(url, headers=None, timeout=15.0, retries=3):
+            captured["url"] = url
+            return obj
+
+        monkeypatch.setattr(recon, "http_get_json", fake)
+        res = recon.fetch_rdap("8.8.8.8")
+        assert "/ip/" in captured["url"]
+        assert res["kind"] == "ip"
+
+    def test_fetch_autodetects_asn(self, monkeypatch):
+        obj = load_fixture("rdap_asn_15169.json")
+        captured = {}
+
+        def fake(url, headers=None, timeout=15.0, retries=3):
+            captured["url"] = url
+            return obj
+
+        monkeypatch.setattr(recon, "http_get_json", fake)
+        res = recon.fetch_rdap("AS15169")
+        assert "/autnum/15169" in captured["url"]
+        assert res["kind"] == "asn"
+
+
+# ---------------------------------------------------------------------------
+# DNS-over-HTTPS
+# ---------------------------------------------------------------------------
+
+
+class TestDns:
+    def test_parse_a(self):
+        res = recon.parse_dns(load_fixture("dns_google_a.json"), "example.com", "A")
+        assert res["status_text"] == "NOERROR"
+        assert res["answer_count"] == 2
+        assert all(a["type"] == "A" for a in res["answers"])
+
+    def test_parse_aaaa_cloudflare(self):
+        res = recon.parse_dns(load_fixture("dns_cloudflare_aaaa.json"), "example.com", "AAAA")
+        assert res["answer_count"] == 2
+        assert all(":" in a["data"] for a in res["answers"])
+
+    def test_parse_mx(self):
+        res = recon.parse_dns(load_fixture("dns_google_mx.json"), "example.com", "MX")
+        assert res["answers"][0]["type"] == "MX"
+
+    def test_parse_txt(self):
+        res = recon.parse_dns(load_fixture("dns_google_txt.json"), "example.com", "TXT")
+        assert res["answer_count"] >= 1
+
+    def test_nxdomain_status(self):
+        res = recon.parse_dns({"Status": 3, "Answer": []}, "nope.example", "A")
+        assert res["status_text"] == "NXDOMAIN"
+        assert res["answer_count"] == 0
+
+    def test_unsupported_type_rejected(self):
+        with pytest.raises(recon.InputError):
+            recon.fetch_dns("example.com", "SRV")
+
+    def test_ptr_supported_for_hostname(self, monkeypatch):
+        captured = {}
+
+        def fake(url, headers=None, timeout=15.0, retries=3):
+            captured["url"] = url
+            return {"Status": 0, "Answer": [{"name": "x", "type": 12, "TTL": 1, "data": "host.example."}]}
+
+        monkeypatch.setattr(recon, "http_get_json", fake)
+        res = recon.fetch_dns("8.8.8.8", "PTR")
+        # A bare IP builds the reverse in-addr.arpa pointer name.
+        assert "8.8.8.8.in-addr.arpa" in captured["url"]
+        assert res["query_type"] == "PTR"
+        assert res["answers"][0]["type"] == "PTR"
+
+    def test_ip_target_implies_ptr(self, monkeypatch):
+        captured = {}
+
+        def fake(url, headers=None, timeout=15.0, retries=3):
+            captured["url"] = url
+            return {"Status": 0, "Answer": []}
+
+        monkeypatch.setattr(recon, "http_get_json", fake)
+        # Asking for the default "A" of an IP literal is coerced to a PTR lookup.
+        res = recon.fetch_dns("8.8.8.8")
+        assert res["query_type"] == "PTR"
+        assert "in-addr.arpa" in captured["url"]
+
+    def test_ptr_ipv6_reverse_pointer(self, monkeypatch):
+        captured = {}
+
+        def fake(url, headers=None, timeout=15.0, retries=3):
+            captured["url"] = url
+            return {"Status": 0, "Answer": []}
+
+        monkeypatch.setattr(recon, "http_get_json", fake)
+        recon.fetch_dns("2606:4700:4700::1111", "PTR")
+        assert "ip6.arpa" in captured["url"]
+
+    def test_unknown_provider_rejected(self):
+        with pytest.raises(recon.InputError):
+            recon.fetch_dns("example.com", "A", provider="nope")
+
+    def test_fetch_many(self, monkeypatch):
+        mapping = {
+            "type=A": load_fixture("dns_google_a.json"),
+            "type=MX": load_fixture("dns_google_mx.json"),
+        }
+
+        def fake(url, headers=None, timeout=15.0, retries=3):
+            for k, v in mapping.items():
+                if k in url:
+                    return v
+            raise AssertionError(url)
+
+        monkeypatch.setattr(recon, "http_get_json", fake)
+        res = recon.fetch_dns_many("example.com", ["A", "MX"])
+        assert set(res["records"]) == {"A", "MX"}
+
+
+# ---------------------------------------------------------------------------
+# ip-api.com
+# ---------------------------------------------------------------------------
+
+
+class TestIp:
+    def test_parse_success(self):
+        res = recon.parse_ip(load_fixture("ipapi_8888.json"))
+        assert res["ip"] == "8.8.8.8"
+        assert res["country_code"] == "US"
+        assert res["as"].startswith("AS15169")
+
+    def test_parse_failure_raises(self):
+        with pytest.raises(recon.ReconError):
+            recon.parse_ip({"status": "fail", "message": "reserved range", "query": "127.0.0.1"})
+
+    def test_fetch_end_to_end(self, monkeypatch):
+        patch_json(monkeypatch, load_fixture("ipapi_8888.json"))
+        res = recon.fetch_ip("8.8.8.8")
+        assert res["isp"] == "Google LLC"
+
+    def test_fetch_rejects_bad_ip(self):
+        with pytest.raises(recon.InputError):
+            recon.fetch_ip("not-an-ip")
+
+
+# ---------------------------------------------------------------------------
+# RIPEstat (ASN / prefix / IP ownership)
+# ---------------------------------------------------------------------------
+
+
+class TestAsn:
+    def test_parse_overview_with_prefixes(self):
+        ov = load_fixture("ripestat_as_overview_15169.json")
+        pf = load_fixture("ripestat_announced_prefixes_15169.json")
+        res = recon.parse_asn_overview(ov, announced_prefixes=pf)
+        assert res["holder"].startswith("GOOGLE")
+        assert res["prefix_count"] == 5
+        assert all("/" in p for p in res["prefixes"])
+
+    def test_parse_overview_without_prefixes(self):
+        ov = load_fixture("ripestat_as_overview_15169.json")
+        res = recon.parse_asn_overview(ov)
+        assert "prefixes" not in res
+
+    def test_parse_network_info(self):
+        res = recon.parse_network_info(load_fixture("ripestat_network_info_8888.json"))
+        assert res["prefix"] == "8.8.8.0/24"
+        assert "15169" in res["asns"]
+
+    def test_parse_missing_data_raises(self):
+        with pytest.raises(recon.ParseError):
+            recon.parse_asn_overview({"no": "data"})
+
+    def test_fetch_ip_uses_network_info(self, monkeypatch):
+        captured = {}
+
+        def fake(url, headers=None, timeout=15.0, retries=3):
+            captured["url"] = url
+            return load_fixture("ripestat_network_info_8888.json")
+
+        monkeypatch.setattr(recon, "http_get_json", fake)
+        res = recon.fetch_asn("8.8.8.8")
+        assert "network-info" in captured["url"]
+        assert res["kind"] == "ip"
+
+    def test_fetch_asn_uses_overview_and_prefixes(self, monkeypatch):
+        urls = []
+
+        def fake(url, headers=None, timeout=15.0, retries=3):
+            urls.append(url)
+            if "as-overview" in url:
+                return load_fixture("ripestat_as_overview_15169.json")
+            if "announced-prefixes" in url:
+                return load_fixture("ripestat_announced_prefixes_15169.json")
+            raise AssertionError(url)
+
+        monkeypatch.setattr(recon, "http_get_json", fake)
+        res = recon.fetch_asn("AS15169")
+        assert res["kind"] == "asn"
+        assert res["prefix_count"] == 5
+        assert any("as-overview" in u for u in urls)
+        assert any("announced-prefixes" in u for u in urls)
+
+
+# ---------------------------------------------------------------------------
+# Wayback (bonus)
+# ---------------------------------------------------------------------------
+
+
+class TestWayback:
+    def test_parse_available(self):
+        res = recon.parse_wayback(load_fixture("wayback_example.json"), "example.com")
+        assert res["archived"] is True
+        assert res["snapshot_url"].startswith("http")
+        assert res["target"] == "example.com"
+
+    def test_parse_absent(self):
+        res = recon.parse_wayback({"url": "x", "archived_snapshots": {}}, "x")
+        assert res["archived"] is False
+
+    def test_fetch_rejects_bad_url(self):
+        with pytest.raises(recon.InputError):
+            recon.fetch_wayback("has a space")
+
+    # --- CDX capture history ---
+
+    def test_parse_cdx_rows(self):
+        rows = load_fixture("wayback_cdx_recent_example.json")
+        caps = recon.parse_cdx(rows)
+        assert len(caps) == len(rows) - 1  # header dropped
+        assert all(c["timestamp"] for c in caps)
+        assert all(c["snapshot_url"].startswith("http://web.archive.org/web/") for c in caps)
+        # header maps columns correctly regardless of position
+        assert caps[0]["statuscode"] == "200"
+
+    def test_parse_cdx_empty_and_header_only(self):
+        assert recon.parse_cdx([]) == []
+        assert recon.parse_cdx([["timestamp", "original"]]) == []
+        assert recon.parse_cdx(None) == []
+
+    def test_parse_cdx_rejects_non_list(self):
+        with pytest.raises(recon.ParseError):
+            recon.parse_cdx({"not": "rows"})
+
+    def _cdx_dispatch(self, monkeypatch):
+        first = load_fixture_text("wayback_cdx_first_example.json")
+        recent = load_fixture_text("wayback_cdx_recent_example.json")
+
+        def fake_http_get(url, headers=None, timeout=15.0, retries=3):
+            if "collapse" in url:
+                return recent  # stand-in for the month-collapse scan
+            if "limit=-" in url:
+                return recent
+            if "limit=1" in url:
+                return first
+            raise AssertionError("unexpected cdx url: {}".format(url))
+
+        monkeypatch.setattr(recon, "http_get", fake_http_get)
+
+    def test_fetch_cdx_first_last_recent(self, monkeypatch):
+        self._cdx_dispatch(monkeypatch)
+        cdx = recon.fetch_cdx("example.com", cdx_limit=5)
+        assert cdx["first_capture"]["timestamp"] == "20020120142510"
+        # recent fixture is ascending; newest (last) is the final row
+        assert cdx["last_capture"]["timestamp"] == "20020810100026"
+        assert cdx["recent_count"] == 3
+        # presented newest-first
+        assert cdx["recent"][0]["timestamp"] == "20020810100026"
+        assert "active_months" not in cdx  # count is opt-in
+
+    def test_fetch_cdx_count_optin(self, monkeypatch):
+        self._cdx_dispatch(monkeypatch)
+        cdx = recon.fetch_cdx("example.com", cdx_limit=5, count=True)
+        assert cdx["active_months"] == 3
+
+    def test_fetch_cdx_degrades_gracefully(self, monkeypatch):
+        def boom(url, headers=None, timeout=15.0, retries=3):
+            raise recon.NetworkError("cdx down")
+
+        monkeypatch.setattr(recon, "http_get", boom)
+        cdx = recon.fetch_cdx("example.com")
+        assert "error" in cdx  # captured, not raised
+
+    def test_fetch_wayback_includes_cdx(self, monkeypatch):
+        monkeypatch.setattr(recon, "http_get_json", lambda *a, **k: load_fixture("wayback_example.json"))
+        self._cdx_dispatch(monkeypatch)
+        res = recon.fetch_wayback("example.com", cdx=True, cdx_limit=5)
+        assert res["archived"] is True
+        assert res["cdx"]["first_capture"]["timestamp"] == "20020120142510"
+
+    def test_fetch_wayback_no_cdx(self, monkeypatch):
+        monkeypatch.setattr(recon, "http_get_json", lambda *a, **k: load_fixture("wayback_example.json"))
+        res = recon.fetch_wayback("example.com", cdx=False)
+        assert "cdx" not in res
+
+
+# ---------------------------------------------------------------------------
+# profile orchestrator  (patched at the fetch_* seams)
+# ---------------------------------------------------------------------------
+
+
+def _dns_many(ip="93.184.216.34"):
+    return {
+        "source": "doh",
+        "name": "example.com",
+        "provider": "google",
+        "records": {
+            "A": {"answers": [{"type": "A", "data": ip, "ttl": 300}], "answer_count": 1},
+            "AAAA": {"answers": [], "answer_count": 0},
+            "MX": {"answers": [{"type": "MX", "data": "0 mail.example.com.", "ttl": 300}], "answer_count": 1},
+            "TXT": {"answers": [], "answer_count": 0},
+            "NS": {"answers": [{"type": "NS", "data": "a.iana-servers.net.", "ttl": 300}], "answer_count": 1},
+            "CAA": {"answers": [], "answer_count": 0},
+        },
+    }
+
+
+def _install_profile_fakes(monkeypatch, resolve_map, certs_subs=None, ip_fail=None):
+    certs_subs = certs_subs if certs_subs is not None else ["www.example.com", "api.example.com", "mail.example.com"]
+
+    monkeypatch.setattr(
+        recon, "fetch_certs",
+        lambda *a, **k: {"source": "crt.sh", "target": "example.com", "subdomains": certs_subs,
+                         "subdomain_count": len(certs_subs), "subdomains_truncated": False},
+    )
+    monkeypatch.setattr(
+        recon, "fetch_rdap",
+        lambda *a, **k: {"source": "rdap.org", "kind": "domain",
+                         "events": {"registration": "2020-01-01"}, "nameservers": ["a.iana-servers.net"]},
+    )
+    monkeypatch.setattr(recon, "fetch_dns_many", lambda *a, **k: _dns_many())
+
+    def fake_dns(name, rrtype, provider="google", timeout=20.0, retries=3):
+        addr = resolve_map.get(name, {}).get(rrtype, [])
+        return {"answers": [{"type": rrtype, "data": d, "ttl": 300} for d in addr]}
+
+    monkeypatch.setattr(recon, "fetch_dns", fake_dns)
+
+    def fake_ip(ip, timeout=20.0, retries=3):
+        if ip_fail and ip == ip_fail:
+            raise recon.RateLimitError("ip-api throttled")
+        return {"source": "ip-api.com", "ip": ip, "as": "AS15133 Edgecast", "country": "US", "city": "LA"}
+
+    monkeypatch.setattr(recon, "fetch_ip", fake_ip)
+    monkeypatch.setattr(
+        recon, "fetch_asn",
+        lambda ip, **k: {"source": "ripestat", "kind": "ip", "prefix": "93.184.216.0/24", "asns": ["15133"]},
+    )
+    monkeypatch.setattr(
+        recon, "fetch_wayback",
+        lambda t, **k: {"source": "wayback", "url": t, "archived": True, "cdx": {"first_capture": {"timestamp": "2002"}}},
+    )
+
+
+class TestProfile:
+    def test_happy_path_wiring_and_dedup(self, monkeypatch):
+        # www shares the apex IP; api and mail share another -> 2 unique hosts.
+        resolve_map = {
+            "www.example.com": {"A": ["93.184.216.34"], "AAAA": []},
+            "api.example.com": {"A": ["1.2.3.4"], "AAAA": []},
+            "mail.example.com": {"A": ["1.2.3.4"], "AAAA": []},
+        }
+        _install_profile_fakes(monkeypatch, resolve_map)
+        rep = recon.run_profile("example.com")
+        assert rep["source"] == "profile"
+        assert rep["target"] == "example.com"
+        assert rep["apex"]["rdap"]["kind"] == "domain"
+        assert set(rep["apex"]["dns"]["records"]) == {"A", "AAAA", "MX", "TXT", "NS", "CAA"}
+        assert rep["subdomains"]["count"] == 3
+        # unique IPs only: apex 93.184.216.34 (+www dup) and 1.2.3.4 (api+mail dup)
+        assert set(rep["hosts"]) == {"93.184.216.34", "1.2.3.4"}
+        assert rep["hosts"]["1.2.3.4"]["asn"]["asns"] == ["15133"]
+        assert rep["errors"] == []
+        assert len(rep["wayback"]) >= 1
+
+    def test_fault_isolation_certs_down(self, monkeypatch):
+        _install_profile_fakes(monkeypatch, {})
+        monkeypatch.setattr(recon, "fetch_certs", lambda *a, **k: (_ for _ in ()).throw(recon.NetworkError("crt.sh 503")))
+        rep = recon.run_profile("example.com")
+        steps = [e["step"] for e in rep["errors"]]
+        assert "certs" in steps
+        # profile still produced the rest of the report
+        assert rep["apex"]["rdap"] is not None
+        assert rep["apex"]["dns"] is not None
+
+    def test_single_source_failure_recorded_not_raised(self, monkeypatch):
+        resolve_map = {"www.example.com": {"A": ["9.9.9.9"], "AAAA": []}}
+        _install_profile_fakes(monkeypatch, resolve_map, ip_fail="9.9.9.9")
+        rep = recon.run_profile("example.com")
+        # the failed ip-api call for 9.9.9.9 is recorded, others still enriched
+        assert any(e["step"] == "ip:9.9.9.9" for e in rep["errors"])
+        assert "93.184.216.34" in rep["hosts"]
+
+    def test_ip_limit_truncates(self, monkeypatch):
+        resolve_map = {
+            "www.example.com": {"A": ["1.1.1.1"], "AAAA": []},
+            "api.example.com": {"A": ["2.2.2.2"], "AAAA": []},
+            "mail.example.com": {"A": ["3.3.3.3"], "AAAA": []},
+        }
+        _install_profile_fakes(monkeypatch, resolve_map)
+        rep = recon.run_profile("example.com", ip_limit=2)
+        assert len(rep["hosts"]) == 2
+        assert rep["hosts_truncated"] is True
+
+    def test_rate_limit_spacing_between_ips(self, monkeypatch):
+        resolve_map = {
+            "www.example.com": {"A": ["1.1.1.1"], "AAAA": []},
+            "api.example.com": {"A": ["2.2.2.2"], "AAAA": []},
+            "mail.example.com": {"A": [], "AAAA": []},
+        }
+        _install_profile_fakes(monkeypatch, resolve_map)
+        sleeps = []
+        monkeypatch.setattr(recon, "_sleep", lambda d: sleeps.append(d))
+        rep = recon.run_profile("example.com", pause=1.5)
+        # 3 unique IPs (apex + 1.1.1.1 + 2.2.2.2) -> spacing applied 2 times
+        assert len(rep["hosts"]) == 3
+        assert sleeps == [1.5, 1.5]
+
+    def test_human_render_profile(self, monkeypatch, capsys):
+        resolve_map = {"www.example.com": {"A": ["93.184.216.34"], "AAAA": []}}
+        _install_profile_fakes(monkeypatch, resolve_map)
+        rc = recon.run(["profile", "example.com", "--human"])
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "profile — example.com" in out
+        assert "hosts:" in out
+
+
+# ---------------------------------------------------------------------------
+# HTTP layer failure modes  (patched at the `_open` seam)
+# ---------------------------------------------------------------------------
+
+
+class TestHttpLayer:
+    def test_429_then_success(self, monkeypatch):
+        calls = {"n": 0}
+
+        def flaky(req, timeout):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise make_http_error(429, retry_after=1)
+            return FakeResp('{"ok": true}')
+
+        monkeypatch.setattr(recon, "_open", flaky)
+        assert recon.http_get_json("http://x") == {"ok": True}
+        assert calls["n"] == 2
+
+    def test_429_exhausted_raises_ratelimit(self, monkeypatch):
+        monkeypatch.setattr(recon, "_open", lambda req, timeout: (_ for _ in ()).throw(make_http_error(429)))
+        with pytest.raises(recon.RateLimitError):
+            recon.http_get("http://x", retries=2)
+
+    def test_5xx_retries_then_raises(self, monkeypatch):
+        calls = {"n": 0}
+
+        def boom(req, timeout):
+            calls["n"] += 1
+            raise make_http_error(503)
+
+        monkeypatch.setattr(recon, "_open", boom)
+        with pytest.raises(recon.HTTPStatusError):
+            recon.http_get("http://x", retries=2)
+        assert calls["n"] == 3  # initial + 2 retries
+
+    def test_404_not_retried(self, monkeypatch):
+        calls = {"n": 0}
+
+        def notfound(req, timeout):
+            calls["n"] += 1
+            raise make_http_error(404)
+
+        monkeypatch.setattr(recon, "_open", notfound)
+        with pytest.raises(recon.HTTPStatusError) as ei:
+            recon.http_get("http://x", retries=3)
+        assert ei.value.status == 404
+        assert calls["n"] == 1  # no retries on a 4xx
+
+    def test_timeout_retries_then_networkerror(self, monkeypatch):
+        def slow(req, timeout):
+            raise socket.timeout("timed out")
+
+        monkeypatch.setattr(recon, "_open", slow)
+        with pytest.raises(recon.NetworkError):
+            recon.http_get("http://x", retries=1)
+
+    def test_dns_failure_is_networkerror(self, monkeypatch):
+        def nodns(req, timeout):
+            raise urllib.error.URLError("Name or service not known")
+
+        monkeypatch.setattr(recon, "_open", nodns)
+        with pytest.raises(recon.NetworkError):
+            recon.http_get("http://x", retries=0)
+
+    def test_malformed_json_raises_parseerror(self, monkeypatch):
+        monkeypatch.setattr(recon, "_open", lambda req, timeout: FakeResp("{not valid json"))
+        with pytest.raises(recon.ParseError):
+            recon.http_get_json("http://x")
+
+    def test_empty_body_raises_parseerror(self, monkeypatch):
+        monkeypatch.setattr(recon, "_open", lambda req, timeout: FakeResp(""))
+        with pytest.raises(recon.ParseError):
+            recon.http_get_json("http://x")
+
+    def test_retry_after_header_respected(self, monkeypatch):
+        seen = {"delays": []}
+        monkeypatch.setattr(recon, "_sleep", lambda d: seen["delays"].append(d))
+        calls = {"n": 0}
+
+        def flaky(req, timeout):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise make_http_error(429, retry_after=3)
+            return FakeResp('{"ok": 1}')
+
+        monkeypatch.setattr(recon, "_open", flaky)
+        recon.http_get_json("http://x")
+        assert seen["delays"] == [3.0]
+
+
+# ---------------------------------------------------------------------------
+# CLI surface  (end-to-end via run(), output captured)
+# ---------------------------------------------------------------------------
+
+
+class TestCli:
+    def test_ip_json_output(self, monkeypatch, capsys):
+        patch_json(monkeypatch, load_fixture("ipapi_8888.json"))
+        rc = recon.run(["ip", "8.8.8.8"])
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert '"ip-api.com"' in out
+
+    def test_ip_human_output(self, monkeypatch, capsys):
+        patch_json(monkeypatch, load_fixture("ipapi_8888.json"))
+        rc = recon.run(["ip", "8.8.8.8", "--human"])
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "ip-api — 8.8.8.8" in out
+
+    def test_bad_input_returns_exit_2(self, capsys):
+        rc = recon.run(["ip", "not-an-ip"])
+        err = capsys.readouterr().err
+        assert rc == 2
+        assert "error:" in err
+
+    def test_asn_human_caps_prefix_list(self, monkeypatch, capsys):
+        # Human mode must not dump a 1000+ prefix wall; it caps and says "+N more".
+        big = {
+            "source": "ripestat",
+            "kind": "asn",
+            "asn": "15169",
+            "holder": "GOOGLE",
+            "announced": True,
+            "prefix_count": 100,
+            "prefixes": ["10.{}.0.0/16".format(i) for i in range(100)],
+        }
+        monkeypatch.setattr(recon, "fetch_asn", lambda *a, **k: big)
+        rc = recon.run(["asn", "AS15169", "--human"])
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "+85 more" in out
+        assert out.count("/16") == recon._HUMAN_PREFIX_CAP
+
+    def test_certs_human(self, monkeypatch, capsys):
+        text = load_fixture_text("crtsh_example.json")
+        monkeypatch.setattr(recon, "http_get", lambda *a, **k: text)
+        rc = recon.run(["certs", "example.com", "--human"])
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "crt.sh — example.com" in out
