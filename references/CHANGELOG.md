@@ -1,5 +1,70 @@
 # Changelog / Design decisions — domain-recon
 
+## 0.3.0 — source-outage resilience
+
+Both changes were driven by a live run that hit two real upstream failures at
+once: crt.sh returning `HTTP 502` on every query (a hard outage), and rdap.org
+`404`ing a `.io` domain (its bootstrap doesn't cover several ccTLDs/newer TLDs).
+
+### Added
+- **CT fallback (crt.sh → certSpotter)** — `certs` now tries crt.sh first and,
+  on any failure (`5xx`/`4xx`/timeout/bad-JSON), falls back to **certSpotter**
+  (`api.certspotter.com`, keyless) so subdomain enumeration survives a crt.sh
+  outage. Names from every source that answered are merged + de-duplicated. The
+  result records `sources_used` (which answered) and `errors[]` (which failed)
+  for auditability, and a `200` with an empty set is treated as a genuine "no
+  certs logged" answer (**not** an outage → no needless fallback). `--all-ct`
+  queries both sources and merges for wider coverage. The `profile` orchestrator
+  surfaces a partial CT failure under its own `errors[]` and reports `ct_sources`.
+- **RDAP three-tier resolution** — `rdap` domain lookups now resolve the
+  authoritative RDAP server via the **IANA bootstrap registry**
+  (`data.iana.org/rdap/dns.json`, fetched once per run and memoized) for the
+  ~1200 TLDs it lists (e.g. `.ai`/`.dev`/`.xyz`/`.uk`), a curated **supplement**
+  for TLDs IANA omits, and rdap.org last. `rdap_source` records which tier
+  answered (`iana-bootstrap` / `supplement` / `rdap.org`). IP/ASN lookups stay on
+  rdap.org (complete RIR coverage). `--no-bootstrap` forces rdap.org.
+
+### Decision (solo, flagged): certSpotter as the CT fallback
+Candidates were certSpotter, Cloudflare merklemap, and crt.sh mirrors.
+**certSpotter** was chosen: it is keyless, passive, has a clean documented JSON
+schema (`/v1/issuances` with `expand=dns_names`), and covers the same CT ground.
+merklemap and the mirrors were rejected as less stable / less documented for a
+publish-ready skill. Kept stdlib-only. **Verified live** on 2026-07-26 during a
+real crt.sh hard-`502` outage: `certs example.com` fell back to certSpotter and
+returned subdomains, with the crt.sh `502` recorded in `errors[]`.
+
+### Decision (solo, flagged): the IANA bootstrap alone does NOT fix `.io` — a supplement does
+This is the important one. The obvious fix ("use the IANA bootstrap") turned out
+to be **insufficient for the exact reported case**: a live pull of
+`data.iana.org/rdap/dns.json` shows `.io` is **not in it at all** (nor are `.co`,
+`.me`, `.us`). The bootstrap fixes many other TLDs (`.ai`, `.dev`, `.xyz`, `.uk`,
+…), but not `.io`. Identity Digital *does* serve `.io` RDAP at
+`rdap.identitydigital.services`, so the real fix is a small **curated supplement**
+of TLD→RDAP-base for IANA-omitted TLDs, tried after the bootstrap and before
+rdap.org. Current entries, each verified live (HTTP 200 for a real domain) on
+2026-07-26: `.io`/`.sh`/`.ac` → Identity Digital, `.us` → `rdap.nic.us`.
+`.co`/`.me` were left out (no public RDAP endpoint found on the obvious hosts) —
+extend the map when one is confirmed. Caught only because the live smoke test
+exercised the real `.io` path; the first cut (bootstrap-only) shipped green
+offline but failed live.
+
+### Decision (solo, flagged): domain-only resolution
+The live failure was a `.io` **domain**; IP/ASN RDAP via rdap.org worked. IANA
+also publishes `ipv4.json`/`ipv6.json`/`asn.json`, but adding them was out of
+scope for the reported problem and would add fetch cost + fixtures for a path
+that already works. Domains use the bootstrap+supplement; IP/ASN stay on rdap.org.
+
+### Tests
+- Offline suite expanded to **116 deterministic tests** (+24): certSpotter parse
+  (scope/dedup/wildcards/error-object), CT fallback (crt.sh-down→certSpotter,
+  both-down→clean error, empty-200-is-an-answer, `--all-ct` merge/dedup, profile
+  surfacing); RDAP three-tier (bootstrap parse, `.ai` via bootstrap, `.io` via
+  supplement, supplement-works-when-bootstrap-down, unmapped-TLD → rdap.org,
+  authoritative-`404` → rdap.org, caching, `--no-bootstrap`, IP/ASN still via
+  rdap.org). Live smoke: `certs` source-agnostic + `.io` (supplement) + `.ai`
+  (bootstrap) — all verified passing live on 2026-07-26 under a real crt.sh
+  outage.
+
 ## 0.2.0 — orchestration, archive history, hardening
 
 ### Added

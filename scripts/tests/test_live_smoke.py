@@ -55,8 +55,35 @@ def test_live_dns():
 def test_live_certs():
     def check():
         res = recon.fetch_certs("example.com")
-        assert res["source"] == "crt.sh"
+        assert res["source"] == "ct"
+        # at least one CT source (crt.sh or certSpotter) must have answered
+        assert res["sources_used"]
         assert res["cert_count"] >= 0
+
+    live(check)
+
+
+def test_live_rdap_io():
+    # .io is absent from the IANA bootstrap AND rdap.org 404s it — the curated
+    # supplement is what actually resolves it. This is the exact reported case.
+    def check():
+        recon._RDAP_BOOTSTRAP_CACHE.clear()
+        res = recon.fetch_rdap("github.io")
+        assert res["kind"] == "domain"
+        assert res["ldhName"]
+        # supplement is the expected winner; accept authoritative variants too.
+        assert res["rdap_source"] in ("supplement", "iana-bootstrap")
+
+    live(check)
+
+
+def test_live_rdap_ai_bootstrap():
+    # .ai IS in the IANA bootstrap -> exercises the bootstrap (not supplement) path.
+    def check():
+        recon._RDAP_BOOTSTRAP_CACHE.clear()
+        res = recon.fetch_rdap("nic.ai")
+        assert res["kind"] == "domain"
+        assert res["ldhName"]
 
     live(check)
 

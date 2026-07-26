@@ -4,8 +4,8 @@
 Zero third-party runtime dependencies (Python 3.8+ standard library only).
 
 Sources wrapped:
-  certs    crt.sh                Certificate Transparency -> subdomains + cert history
-  rdap     rdap.org              Modern WHOIS for domain / IP / ASN (JSON)
+  certs    crt.sh + certspotter  Certificate Transparency -> subdomains + cert history
+  rdap     IANA bootstrap/rdap.org  Modern WHOIS for domain / IP / ASN (JSON)
   dns      Google / Cloudflare   DNS-over-HTTPS record lookups
   ip       ip-api.com            IP -> geo / ISP / ASN / hosting+proxy flags
   asn      RIPEstat Data API     ASN / prefix / IP ownership (BGPView replacement)
@@ -30,7 +30,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 USER_AGENT = "domain-recon/{v} (+https://github.com/maggiedev-bot/domain-recon)".format(v=__version__)
 
@@ -320,20 +320,176 @@ def parse_certs(entries, domain: str, include_wildcards: bool = True, limit: "in
     }
 
 
-def fetch_certs(domain: str, include_wildcards=True, limit=None, max_certs=None, timeout=20.0, retries=3) -> dict:
-    d = normalize_domain(domain)
-    q = urllib.parse.quote("%." + d, safe="")
+def parse_certspotter(entries, domain: str, include_wildcards: bool = True, limit: "int | None" = None,
+                      max_certs: "int | None" = None) -> dict:
+    """Normalize a certSpotter `/v1/issuances` JSON array into subdomains + certs.
+
+    certSpotter is the secondary Certificate Transparency source (used when
+    crt.sh is unreachable). Its schema differs from crt.sh: names live in a
+    `dns_names` list per issuance, and the issuer is a nested object. This maps
+    it onto the SAME normalized contract as `parse_certs` so the two can merge.
+    """
+    if entries is None:
+        entries = []
+    # certSpotter returns an error object (not an array) on rejection.
+    if isinstance(entries, dict):
+        msg = entries.get("message") or entries.get("code") or "unexpected object response"
+        raise ParseError("certspotter: {}".format(msg))
+    if not isinstance(entries, list):
+        raise ParseError("certspotter: expected a JSON array, got {}".format(type(entries).__name__))
+
+    suffix = "." + domain
+    names = set()
+    certs = []
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        for n in (e.get("dns_names") or []):
+            n = (n or "").strip().lower().rstrip(".")
+            if not n:
+                continue
+            is_wild = n.startswith("*.")
+            if is_wild and not include_wildcards:
+                continue
+            bare = n[2:] if is_wild else n
+            if bare == domain or bare.endswith(suffix):
+                names.add(n)
+        issuer = e.get("issuer")
+        issuer_name = issuer.get("name") if isinstance(issuer, dict) else issuer
+        certs.append(
+            {
+                "id": e.get("id"),
+                "issuer": issuer_name,
+                "common_name": None,  # certSpotter does not expose a distinct CN
+                "not_before": e.get("not_before"),
+                "not_after": e.get("not_after"),
+                "serial_number": None,
+                "entry_timestamp": None,
+            }
+        )
+
+    all_subdomains = sorted(names)
+    subdomains = all_subdomains[:limit] if limit is not None else all_subdomains
+    cert_total = len(certs)
+    shown_certs = certs[:max_certs] if max_certs is not None else certs
+    return {
+        "source": "certspotter",
+        "target": domain,
+        "domain": domain,
+        "subdomain_count": len(all_subdomains),
+        "subdomains_truncated": len(subdomains) < len(all_subdomains),
+        "subdomains": subdomains,
+        "cert_count": cert_total,
+        "certs_truncated": len(shown_certs) < cert_total,
+        "certs": shown_certs,
+    }
+
+
+# Certificate Transparency sources tried in order (crt.sh primary, certSpotter
+# fallback). Both are keyless/passive.
+CT_SOURCES = ("crtsh", "certspotter")
+
+
+def _fetch_crtsh_raw(domain: str, timeout: float, retries: int):
+    """GET crt.sh and return the decoded JSON array. Empty body -> [] (no certs)."""
+    q = urllib.parse.quote("%." + domain, safe="")
     url = "https://crt.sh/?q={q}&output=json".format(q=q)
-    # crt.sh occasionally returns an empty body for zero results.
     text = http_get(url, timeout=timeout, retries=retries)
     if text.strip() == "":
-        data = []
+        return []
+    try:
+        return json.loads(text)
+    except (ValueError, json.JSONDecodeError) as e:
+        raise ParseError("crt.sh returned non-JSON: {e}".format(e=e))
+
+
+def _fetch_certspotter_raw(domain: str, timeout: float, retries: int):
+    """GET certSpotter issuances and return the decoded JSON array."""
+    q = urllib.parse.quote(domain, safe="")
+    url = (
+        "https://api.certspotter.com/v1/issuances?domain={q}"
+        "&include_subdomains=true&expand=dns_names&expand=issuer".format(q=q)
+    )
+    text = http_get(url, timeout=timeout, retries=retries)
+    if text.strip() == "":
+        return []
+    try:
+        return json.loads(text)
+    except (ValueError, json.JSONDecodeError) as e:
+        raise ParseError("certspotter returned non-JSON: {e}".format(e=e))
+
+
+def _ct_source_names_certs(source: str, domain: str, include_wildcards: bool, timeout: float, retries: int):
+    """Query one CT source and return (names:set, certs:list). Raises on failure.
+
+    A successful HTTP 200 with an empty result set is a valid answer (the domain
+    simply has no logged certificates) — it does NOT raise, which is how the
+    caller distinguishes "no certs logged" from "source is down".
+    """
+    if source == "crtsh":
+        norm = parse_certs(_fetch_crtsh_raw(domain, timeout, retries), domain, include_wildcards=include_wildcards)
+    elif source == "certspotter":
+        norm = parse_certspotter(_fetch_certspotter_raw(domain, timeout, retries), domain, include_wildcards=include_wildcards)
     else:
+        raise InputError("unknown CT source: {!r}".format(source))
+    return set(norm["subdomains"]), norm["certs"]
+
+
+def fetch_certs(domain: str, include_wildcards=True, limit=None, max_certs=None, timeout=20.0, retries=3,
+                sources=None, merge_all=False) -> dict:
+    """Enumerate subdomains via Certificate Transparency with source fallback.
+
+    Tries crt.sh first; if it is unreachable (5xx / 4xx / timeout / bad JSON)
+    the query falls back to certSpotter so subdomain enumeration survives a
+    crt.sh outage. Names from every source that answered are merged and
+    de-duplicated. `sources_used` records which source(s) actually answered and
+    `errors` records any that failed, so a result is always auditable.
+
+    Default behavior stops at the first source that answers (courtesy: don't
+    hammer the fallback when the primary is healthy). Pass ``merge_all=True`` to
+    query every source and union the results for wider coverage.
+
+    Raises a ReconError only when *no* source could be reached.
+    """
+    d = normalize_domain(domain)
+    order = tuple(sources) if sources else CT_SOURCES
+    names = set()
+    certs = []
+    used = []
+    errors = []
+    for src in order:
         try:
-            data = json.loads(text)
-        except (ValueError, json.JSONDecodeError) as e:
-            raise ParseError("crt.sh returned non-JSON: {e}".format(e=e))
-    return parse_certs(data, d, include_wildcards=include_wildcards, limit=limit, max_certs=max_certs)
+            s_names, s_certs = _ct_source_names_certs(src, d, include_wildcards, timeout, retries)
+        except ReconError as e:
+            errors.append({"source": src, "error": str(e)})
+            continue
+        used.append(src)
+        names.update(s_names)
+        certs.extend(s_certs)
+        if not merge_all:
+            break
+
+    if not used:
+        detail = "; ".join("{}: {}".format(e["source"], e["error"]) for e in errors) or "no CT sources configured"
+        raise ReconError("all CT sources failed ({})".format(detail))
+
+    all_subdomains = sorted(names)
+    subdomains = all_subdomains[:limit] if limit is not None else all_subdomains
+    cert_total = len(certs)
+    shown_certs = certs[:max_certs] if max_certs is not None else certs
+    return {
+        "source": "ct",
+        "target": d,
+        "domain": d,
+        "sources_used": used,
+        "errors": errors,
+        "subdomain_count": len(all_subdomains),
+        "subdomains_truncated": len(subdomains) < len(all_subdomains),
+        "subdomains": subdomains,
+        "cert_count": cert_total,
+        "certs_truncated": len(shown_certs) < cert_total,
+        "certs": shown_certs,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -362,7 +518,7 @@ def parse_rdap(obj, kind: str) -> dict:
     if not isinstance(obj, dict):
         raise ParseError("rdap: expected a JSON object")
     base = {
-        "source": "rdap.org",
+        "source": "rdap",
         "kind": kind,
         "handle": obj.get("handle"),
         "status": obj.get("status") or [],
@@ -390,22 +546,135 @@ def parse_rdap(obj, kind: str) -> dict:
     return base
 
 
-def fetch_rdap(resource: str, kind: "str | None" = None, timeout=20.0, retries=3) -> dict:
+# IANA RDAP bootstrap: maps a TLD -> the authoritative RDAP base URL. rdap.org
+# is only a redirector and its coverage is incomplete (e.g. it 404s `.io` and
+# other ccTLDs/newer TLDs), so we resolve the authoritative server ourselves and
+# fall back to rdap.org only when the TLD is absent from the registry.
+_RDAP_BOOTSTRAP_URL = "https://data.iana.org/rdap/dns.json"
+
+# Process-lifetime memo of the parsed {tld: base_url} map (fetched at most once
+# per run). Reset between tests via recon._RDAP_BOOTSTRAP_CACHE.clear().
+_RDAP_BOOTSTRAP_CACHE: "dict[str, dict]" = {}
+
+# Curated supplement: TLDs that IANA *omits* from its RDAP bootstrap yet that run
+# a public RDAP server anyway. rdap.org 404s these, so without this map they are
+# unresolvable. This is what actually fixes `.io` (the reported case): `.io` is
+# NOT in data.iana.org/rdap/dns.json, but Identity Digital serves its RDAP.
+# Each base verified live (HTTP 200 for a real domain) on 2026-07-26; keep the
+# list short + verified. Bootstrap always wins when it covers the TLD.
+_RDAP_SUPPLEMENT = {
+    "io": "https://rdap.identitydigital.services/rdap",
+    "sh": "https://rdap.identitydigital.services/rdap",
+    "ac": "https://rdap.identitydigital.services/rdap",
+    "us": "https://rdap.nic.us",
+}
+
+
+def parse_rdap_bootstrap(obj) -> dict:
+    """Parse IANA `dns.json` into a {tld: authoritative_base_url} mapping.
+
+    Each service entry is `[[tlds...], [urls...]]`; we prefer an https base and
+    strip the trailing slash for clean joining.
+    """
+    if not isinstance(obj, dict) or "services" not in obj:
+        raise ParseError("rdap bootstrap: missing 'services'")
+    mapping = {}
+    for svc in obj.get("services") or []:
+        if not isinstance(svc, list) or len(svc) < 2:
+            continue
+        tlds, urls = svc[0], svc[1]
+        base = None
+        for u in urls or []:
+            if isinstance(u, str) and u.startswith("https"):
+                base = u
+                break
+        if base is None:
+            for u in urls or []:
+                if isinstance(u, str) and u:
+                    base = u
+                    break
+        if not base:
+            continue
+        for t in tlds or []:
+            key = str(t).strip(".").lower()
+            if key:
+                mapping[key] = base.rstrip("/")
+    return mapping
+
+
+def _load_rdap_bootstrap(timeout: float, retries: int) -> dict:
+    """Fetch + parse the IANA bootstrap once, memoized for the process."""
+    cached = _RDAP_BOOTSTRAP_CACHE.get("dns")
+    if cached is not None:
+        return cached
+    mapping = parse_rdap_bootstrap(http_get_json(_RDAP_BOOTSTRAP_URL, timeout=timeout, retries=retries))
+    _RDAP_BOOTSTRAP_CACHE["dns"] = mapping
+    return mapping
+
+
+def _rdap_base_for_domain(domain: str, timeout: float, retries: int):
+    """Resolve the authoritative RDAP domain URL for `domain`.
+
+    Returns (url, origin) where origin is 'iana-bootstrap' or 'supplement', or
+    (None, None) if the TLD is in neither the IANA registry nor the curated
+    supplement. The bootstrap is consulted first; the supplement fills only the
+    gaps IANA leaves (e.g. `.io`), and still applies if the bootstrap itself is
+    unreachable.
+    """
+    tld = domain.rsplit(".", 1)[-1]
+    base, origin = None, None
+    try:
+        mapping = _load_rdap_bootstrap(timeout, retries)
+        if tld in mapping:
+            base, origin = mapping[tld], "iana-bootstrap"
+    except ReconError:
+        pass  # bootstrap unavailable -> supplement / rdap.org still available
+    if base is None and tld in _RDAP_SUPPLEMENT:
+        base, origin = _RDAP_SUPPLEMENT[tld], "supplement"
+    if base is None:
+        return None, None
+    return "{b}/domain/{d}".format(b=base.rstrip("/"), d=urllib.parse.quote(domain, safe="")), origin
+
+
+def _fetch_rdap_domain(domain: str, timeout: float, retries: int, use_bootstrap: bool = True):
+    """Fetch a domain RDAP object, preferring the authoritative server.
+
+    Returns (obj, rdap_source). Tries the bootstrap/supplement-resolved
+    authoritative server first; on any failure (or an unmapped TLD, or bootstrap
+    disabled) falls back to the rdap.org redirector.
+    """
+    if use_bootstrap:
+        base, origin = _rdap_base_for_domain(domain, timeout, retries)
+        if base:
+            try:
+                return http_get_json(base, timeout=timeout, retries=retries), origin
+            except ReconError:
+                pass  # authoritative server failed -> try the redirector
+    url = "https://rdap.org/domain/{}".format(urllib.parse.quote(domain, safe=""))
+    return http_get_json(url, timeout=timeout, retries=retries), "rdap.org"
+
+
+def fetch_rdap(resource: str, kind: "str | None" = None, timeout=20.0, retries=3, use_bootstrap=True) -> dict:
     kind = kind or classify_resource(resource)
+    rdap_source = None
     if kind == "domain":
         d = normalize_domain(resource)
-        url = "https://rdap.org/domain/{}".format(urllib.parse.quote(d, safe=""))
+        obj, rdap_source = _fetch_rdap_domain(d, timeout, retries, use_bootstrap=use_bootstrap)
     elif kind == "ip":
         ip = normalize_ip(resource)
         url = "https://rdap.org/ip/{}".format(urllib.parse.quote(ip, safe=""))
+        obj = http_get_json(url, timeout=timeout, retries=retries)
+        rdap_source = "rdap.org"
     elif kind == "asn":
         asn = normalize_asn(resource)
         url = "https://rdap.org/autnum/{}".format(asn)
+        obj = http_get_json(url, timeout=timeout, retries=retries)
+        rdap_source = "rdap.org"
     else:
         raise InputError("unknown RDAP kind: {!r}".format(kind))
-    obj = http_get_json(url, timeout=timeout, retries=retries)
     res = parse_rdap(obj, kind)
     res["target"] = resource
+    res["rdap_source"] = rdap_source
     return res
 
 
@@ -815,10 +1084,16 @@ def run_profile(
             errors.append({"step": name, "error": str(e)})
             return None
 
-    # 1. Certificate Transparency -> subdomains (capped).
+    # 1. Certificate Transparency -> subdomains (capped). fetch_certs already
+    #    falls back crt.sh -> certSpotter internally; a *partial* failure (one
+    #    CT source down, another answered) is surfaced here so it stays auditable.
     certs = step("certs", lambda: fetch_certs(apex, limit=cert_limit, timeout=timeout, retries=retries))
     subs = certs["subdomains"] if certs else []
     sub_count = certs["subdomain_count"] if certs else 0
+    ct_sources = certs.get("sources_used") if certs else []
+    if certs:
+        for ce in certs.get("errors") or []:
+            errors.append({"step": "certs:{}".format(ce["source"]), "error": ce["error"]})
 
     # 2. RDAP on the apex.
     rdap = step("rdap", lambda: fetch_rdap(apex, kind="domain", timeout=timeout, retries=retries))
@@ -873,6 +1148,7 @@ def run_profile(
             "count": sub_count,
             "returned": len(subs),
             "truncated": bool(certs and certs.get("subdomains_truncated")),
+            "ct_sources": ct_sources,
             "sample": subs,
             "resolved": resolved,
         },
@@ -896,13 +1172,16 @@ _HUMAN_PREFIX_CAP = 15
 def render_human(result: dict) -> str:
     src = result.get("source")
     lines = []
-    if src == "crt.sh":
-        lines.append("crt.sh — {}".format(result["domain"]))
+    if src in ("ct", "crt.sh", "certspotter"):
+        via = ", ".join(result.get("sources_used") or [src])
+        lines.append("certs — {} (via {})".format(result["domain"], via))
         lines.append("  subdomains ({}):".format(result["subdomain_count"]))
         for s in result["subdomains"]:
             lines.append("    {}".format(s))
         lines.append("  certificates: {}".format(result["cert_count"]))
-    elif src == "rdap.org":
+        for err in result.get("errors") or []:
+            lines.append("  ! {} unavailable: {}".format(err["source"], err["error"]))
+    elif src == "rdap":
         lines.append("RDAP ({}) — {}".format(result["kind"], result.get("handle")))
         for k in ("ldhName", "name", "startAddress", "endAddress", "country", "startAutnum", "endAutnum", "dnssec"):
             if result.get(k) is not None:
@@ -1049,10 +1328,14 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--no-wildcards", action="store_true", help="exclude *.wildcard subdomains")
     c.add_argument("--limit", type=int, default=None, help="cap the returned subdomain list (full count still reported)")
     c.add_argument("--max-certs", type=int, default=None, help="cap the returned certificate-history rows")
+    c.add_argument("--all-ct", action="store_true",
+                   help="query every CT source (crt.sh + certSpotter) and merge, instead of stopping at the first")
 
     r = sub.add_parser("rdap", parents=[common], help="RDAP (WHOIS) for domain / IP / ASN")
     r.add_argument("resource")
     r.add_argument("--kind", choices=["domain", "ip", "asn"], help="force resource kind (default: auto-detect)")
+    r.add_argument("--no-bootstrap", action="store_true",
+                   help="skip the IANA bootstrap; query rdap.org directly (domains only)")
 
     d = sub.add_parser("dns", parents=[common], help="DNS-over-HTTPS record lookup (PTR auto for IP targets)")
     d.add_argument("name")
@@ -1092,9 +1375,16 @@ def run(argv=None) -> int:
                 max_certs=args.max_certs,
                 timeout=args.timeout,
                 retries=args.retries,
+                merge_all=args.all_ct,
             )
         elif args.cmd == "rdap":
-            res = fetch_rdap(args.resource, kind=args.kind, timeout=args.timeout, retries=args.retries)
+            res = fetch_rdap(
+                args.resource,
+                kind=args.kind,
+                timeout=args.timeout,
+                retries=args.retries,
+                use_bootstrap=not args.no_bootstrap,
+            )
         elif args.cmd == "dns":
             types = [t.strip() for t in args.type.split(",") if t.strip()]
             if len(types) == 1:

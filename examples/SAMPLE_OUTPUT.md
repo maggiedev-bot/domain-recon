@@ -49,26 +49,62 @@ RIPEstat ASN 15169 — GOOGLE - Google LLC
   "ipVersion": "v4",
   "kind": "ip",
   "name": "GOGL",
-  "source": "rdap.org",
+  "rdap_source": "rdap.org",
+  "source": "rdap",
   "startAddress": "8.8.8.0",
   "status": ["active"],
   "type": "DIRECT ALLOCATION"
 }
 ```
+> `rdap_source` records which tier answered: `iana-bootstrap`, `supplement`, or
+> `rdap.org`. IP/ASN lookups always use `rdap.org`.
 
-## `certs example.com --human`
+## `rdap github.io`   (ccTLD `.io` — resolved via the curated supplement)
+```json
+{
+  "kind": "domain",
+  "ldhName": "github.io",
+  "nameservers": [
+    "dns1.p05.nsone.net", "dns2.p05.nsone.net", "dns3.p05.nsone.net",
+    "ns-1622.awsdns-10.co.uk", "ns-692.awsdns-22.net"
+  ],
+  "rdap_source": "supplement",
+  "source": "rdap",
+  "target": "github.io"
+}
 ```
-crt.sh — example.com
-  subdomains (N):
-    example.com
+> `.io` is **absent from IANA's RDAP bootstrap** and rdap.org `404`s it, so the
+> lookup would fail with bootstrap alone. The curated supplement routes `.io` to
+> Identity Digital's RDAP server — `rdap_source: "supplement"` shows that path won.
+
+## `certs example.com --human`   (crt.sh down → certSpotter fallback)
+Captured live on 2026-07-26 while crt.sh was returning `HTTP 502` on every query:
+```
+certs — example.com (via certspotter)
+  subdomains (3):
     *.example.com
+    example.com
     www.example.com
-    ...
-  certificates: N
+  certificates: 5
+  ! crtsh unavailable: HTTP 502 from https://crt.sh/?q=%25.example.com&output=json
 ```
-> Note: crt.sh is frequently rate-limited / slow under load. The helper retries
-> with backoff; if it is temporarily down you'll get a clean `error:` on stderr
-> and a non-zero exit, not a crash.
+The JSON form carries the same audit trail:
+```json
+{
+  "source": "ct",
+  "sources_used": ["certspotter"],
+  "errors": [
+    {"source": "crtsh", "error": "HTTP 502 from https://crt.sh/?q=%25.example.com&output=json"}
+  ],
+  "subdomain_count": 3,
+  "subdomains": ["*.example.com", "example.com", "www.example.com"]
+}
+```
+> `certs` tries crt.sh first and falls back to certSpotter on any failure, so a
+> crt.sh outage no longer kills subdomain enumeration. `sources_used` shows which
+> CT source answered; `errors[]` records what failed. A `200` with no certs is a
+> real "no certs logged" answer and does **not** trigger the fallback. Use
+> `--all-ct` to query both sources and merge for wider coverage.
 
 ## `wayback example.com --cdx-limit 3`   (availability fast-path + CDX history)
 ```json

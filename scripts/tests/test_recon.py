@@ -801,4 +801,299 @@ class TestCli:
         rc = recon.run(["certs", "example.com", "--human"])
         out = capsys.readouterr().out
         assert rc == 0
-        assert "crt.sh — example.com" in out
+        assert "certs — example.com (via crtsh)" in out
+
+
+# ---------------------------------------------------------------------------
+# CT fallback: crt.sh -> certSpotter  (Tweak 1)
+# ---------------------------------------------------------------------------
+
+
+class TestCertspotterParse:
+    def test_scopes_and_dedup(self):
+        entries = load_fixture("certspotter_example.json")
+        res = recon.parse_certspotter(entries, "example.com")
+        assert res["source"] == "certspotter"
+        assert "www.example.com" in res["subdomains"]
+        assert "*.example.com" in res["subdomains"]
+        # out-of-apex SANs are dropped exactly like crt.sh
+        assert "unrelated.attacker.test" not in res["subdomains"]
+        assert res["subdomains"] == sorted(set(res["subdomains"]))
+        assert res["cert_count"] == 3
+
+    def test_no_wildcards(self):
+        entries = load_fixture("certspotter_example.json")
+        res = recon.parse_certspotter(entries, "example.com", include_wildcards=False)
+        assert all(not s.startswith("*.") for s in res["subdomains"])
+
+    def test_error_object_raises(self):
+        # certSpotter returns {"code","message"} (a dict) when it rejects a query.
+        with pytest.raises(recon.ParseError):
+            recon.parse_certspotter({"code": "rate_limited", "message": "slow down"}, "example.com")
+
+    def test_non_list_raises(self):
+        with pytest.raises(recon.ParseError):
+            recon.parse_certspotter(42, "example.com")
+
+    def test_none_is_empty(self):
+        assert recon.parse_certspotter(None, "example.com")["subdomain_count"] == 0
+
+
+class TestCtFallback:
+    def test_crtsh_down_falls_back_to_certspotter(self, monkeypatch):
+        cs_text = load_fixture_text("certspotter_example.json")
+
+        def fake_http_get(url, headers=None, timeout=15.0, retries=3):
+            if "crt.sh" in url:
+                raise recon.HTTPStatusError(502, url)
+            if "certspotter" in url:
+                return cs_text
+            raise AssertionError("unexpected url: " + url)
+
+        monkeypatch.setattr(recon, "http_get", fake_http_get)
+        res = recon.fetch_certs("example.com")
+        assert res["source"] == "ct"
+        assert res["sources_used"] == ["certspotter"]
+        assert "www.example.com" in res["subdomains"]
+        assert "mail.example.com" in res["subdomains"]
+        assert "unrelated.attacker.test" not in res["subdomains"]
+        # the crt.sh 502 is recorded for audit, not swallowed silently
+        assert any(e["source"] == "crtsh" and "502" in e["error"] for e in res["errors"])
+
+    def test_both_sources_down_raises_clean_error(self, monkeypatch):
+        monkeypatch.setattr(
+            recon, "http_get",
+            lambda *a, **k: (_ for _ in ()).throw(recon.NetworkError("name resolution failed")),
+        )
+        with pytest.raises(recon.ReconError):
+            recon.fetch_certs("example.com")
+
+    def test_crtsh_empty_200_is_answer_not_outage(self, monkeypatch):
+        # A 200 with an empty body means "no certs logged" — a real answer.
+        # The fallback must NOT be queried in that case.
+        seen = []
+
+        def fake(url, headers=None, timeout=15.0, retries=3):
+            seen.append(url)
+            if "crt.sh" in url:
+                return ""  # crt.sh's zero-result sentinel
+            raise AssertionError("fallback should not be hit: " + url)
+
+        monkeypatch.setattr(recon, "http_get", fake)
+        res = recon.fetch_certs("example.com")
+        assert res["sources_used"] == ["crtsh"]
+        assert res["subdomain_count"] == 0
+        assert res["errors"] == []
+        assert not any("certspotter" in u for u in seen)
+
+    def test_merge_all_unions_and_dedups(self, monkeypatch):
+        crt_text = load_fixture_text("crtsh_example.json")
+        cs_text = load_fixture_text("certspotter_example.json")
+
+        def fake(url, headers=None, timeout=15.0, retries=3):
+            if "crt.sh" in url:
+                return crt_text
+            if "certspotter" in url:
+                return cs_text
+            raise AssertionError("unexpected url: " + url)
+
+        monkeypatch.setattr(recon, "http_get", fake)
+        res = recon.fetch_certs("example.com", merge_all=True)
+        assert res["sources_used"] == ["crtsh", "certspotter"]
+        # crt.sh gives example.com + *.example.com; certSpotter adds www/api/mail
+        assert set(res["subdomains"]) == {
+            "*.example.com", "api.example.com", "example.com",
+            "mail.example.com", "www.example.com",
+        }
+        # cert-history rows are concatenated across both sources
+        assert res["cert_count"] == 12 + 3
+
+    def test_fallback_error_surfaces_in_profile(self, monkeypatch):
+        resolve_map = {"www.example.com": {"A": ["93.184.216.34"], "AAAA": []}}
+        _install_profile_fakes(monkeypatch, resolve_map)
+        monkeypatch.setattr(
+            recon, "fetch_certs",
+            lambda *a, **k: {
+                "source": "ct", "subdomains": ["www.example.com"], "subdomain_count": 1,
+                "subdomains_truncated": False, "sources_used": ["certspotter"],
+                "errors": [{"source": "crtsh", "error": "HTTP 502 from crt.sh"}],
+            },
+        )
+        rep = recon.run_profile("example.com")
+        assert rep["subdomains"]["ct_sources"] == ["certspotter"]
+        assert any(e["step"] == "certs:crtsh" for e in rep["errors"])
+
+
+# ---------------------------------------------------------------------------
+# RDAP IANA bootstrap: .io / ccTLD resolution  (Tweak 2)
+# ---------------------------------------------------------------------------
+
+
+class TestRdapBootstrap:
+    @pytest.fixture(autouse=True)
+    def _clear_cache(self):
+        recon._RDAP_BOOTSTRAP_CACHE.clear()
+        yield
+        recon._RDAP_BOOTSTRAP_CACHE.clear()
+
+    def test_parse_bootstrap_maps_tlds(self):
+        m = recon.parse_rdap_bootstrap(load_fixture("rdap_bootstrap_dns.json"))
+        assert m["ai"] == "https://rdap.identitydigital.services/rdap"
+        assert m["com"].startswith("https://rdap.verisign.com")
+        # .io is intentionally absent from IANA's bootstrap (matches reality)
+        assert "io" not in m
+
+    def test_parse_bootstrap_rejects_missing_services(self):
+        with pytest.raises(recon.ParseError):
+            recon.parse_rdap_bootstrap({"version": "1.0"})
+
+    def test_base_via_bootstrap_for_ai(self, monkeypatch):
+        # .ai IS in the bootstrap -> authoritative server, origin 'iana-bootstrap'
+        monkeypatch.setattr(recon, "http_get_json", lambda url, **k: load_fixture("rdap_bootstrap_dns.json"))
+        base, origin = recon._rdap_base_for_domain("example.ai", 5, 1)
+        assert origin == "iana-bootstrap"
+        assert base == "https://rdap.identitydigital.services/rdap/domain/example.ai"
+
+    def test_base_via_supplement_for_io(self, monkeypatch):
+        # .io is NOT in the bootstrap -> the curated supplement resolves it. This
+        # is the exact reported case (rdap.org 404s .io).
+        monkeypatch.setattr(recon, "http_get_json", lambda url, **k: load_fixture("rdap_bootstrap_dns.json"))
+        base, origin = recon._rdap_base_for_domain("example.io", 5, 1)
+        assert origin == "supplement"
+        assert base == "https://rdap.identitydigital.services/rdap/domain/example.io"
+
+    def test_supplement_works_even_if_bootstrap_unreachable(self, monkeypatch):
+        # bootstrap down, but .io is in the supplement -> still resolves.
+        monkeypatch.setattr(
+            recon, "http_get_json",
+            lambda url, **k: (_ for _ in ()).throw(recon.NetworkError("iana down")),
+        )
+        base, origin = recon._rdap_base_for_domain("example.io", 5, 1)
+        assert origin == "supplement"
+        assert "identitydigital" in base
+
+    def test_base_none_for_unmapped_tld(self, monkeypatch):
+        monkeypatch.setattr(recon, "http_get_json", lambda url, **k: load_fixture("rdap_bootstrap_dns.json"))
+        base, origin = recon._rdap_base_for_domain("example.zzz", 5, 1)
+        assert base is None and origin is None
+
+    def test_bootstrap_is_cached(self, monkeypatch):
+        calls = {"n": 0}
+
+        def fake(url, **k):
+            calls["n"] += 1
+            return load_fixture("rdap_bootstrap_dns.json")
+
+        monkeypatch.setattr(recon, "http_get_json", fake)
+        recon._rdap_base_for_domain("a.ai", 5, 1)
+        recon._rdap_base_for_domain("b.ai", 5, 1)
+        assert calls["n"] == 1  # fetched once, then memoized
+
+    def test_fetch_ai_uses_bootstrap_server(self, monkeypatch):
+        urls = []
+
+        def fake(url, headers=None, timeout=15.0, retries=3):
+            urls.append(url)
+            if "data.iana.org" in url:
+                return load_fixture("rdap_bootstrap_dns.json")
+            if "identitydigital" in url:
+                return load_fixture("rdap_domain_example.json")
+            raise AssertionError("unexpected url: " + url)
+
+        monkeypatch.setattr(recon, "http_get_json", fake)
+        res = recon.fetch_rdap("example.ai")
+        assert res["kind"] == "domain"
+        assert res["rdap_source"] == "iana-bootstrap"
+        assert any("identitydigital" in u for u in urls)
+        assert not any("rdap.org" in u for u in urls)  # authoritative, not the redirector
+
+    def test_fetch_io_uses_supplement_server(self, monkeypatch):
+        # The reported case: .io resolves via the supplement, NOT rdap.org.
+        urls = []
+
+        def fake(url, headers=None, timeout=15.0, retries=3):
+            urls.append(url)
+            if "data.iana.org" in url:
+                return load_fixture("rdap_bootstrap_dns.json")  # io absent here
+            if "identitydigital" in url:
+                return load_fixture("rdap_domain_example.json")
+            raise AssertionError("unexpected url: " + url)
+
+        monkeypatch.setattr(recon, "http_get_json", fake)
+        res = recon.fetch_rdap("example.io")
+        assert res["kind"] == "domain"
+        assert res["rdap_source"] == "supplement"
+        assert any("identitydigital" in u for u in urls)
+        assert not any("rdap.org" in u for u in urls)
+
+    def test_fetch_unmapped_tld_falls_back_to_rdap_org(self, monkeypatch):
+        urls = []
+
+        def fake(url, headers=None, timeout=15.0, retries=3):
+            urls.append(url)
+            if "data.iana.org" in url:
+                return load_fixture("rdap_bootstrap_dns.json")
+            if "rdap.org" in url:
+                return load_fixture("rdap_domain_example.json")
+            raise AssertionError("unexpected url: " + url)
+
+        monkeypatch.setattr(recon, "http_get_json", fake)
+        res = recon.fetch_rdap("example.zzz")  # .zzz in neither bootstrap nor supplement
+        assert res["rdap_source"] == "rdap.org"
+        assert any("rdap.org/domain" in u for u in urls)
+
+    def test_bootstrap_unreachable_io_still_uses_supplement(self, monkeypatch):
+        def fake(url, headers=None, timeout=15.0, retries=3):
+            if "data.iana.org" in url:
+                raise recon.NetworkError("iana unreachable")
+            if "identitydigital" in url:
+                return load_fixture("rdap_domain_example.json")
+            raise AssertionError("unexpected url: " + url)
+
+        monkeypatch.setattr(recon, "http_get_json", fake)
+        res = recon.fetch_rdap("example.io")
+        assert res["rdap_source"] == "supplement"
+
+    def test_authoritative_404_falls_back_to_rdap_org(self, monkeypatch):
+        def fake(url, headers=None, timeout=15.0, retries=3):
+            if "data.iana.org" in url:
+                return load_fixture("rdap_bootstrap_dns.json")
+            if "identitydigital" in url:
+                raise recon.HTTPStatusError(404, url)
+            if "rdap.org" in url:
+                return load_fixture("rdap_domain_example.json")
+            raise AssertionError("unexpected url: " + url)
+
+        monkeypatch.setattr(recon, "http_get_json", fake)
+        res = recon.fetch_rdap("example.io")  # supplement server 404s -> redirector
+        assert res["rdap_source"] == "rdap.org"
+
+    def test_no_bootstrap_flag_uses_rdap_org(self, monkeypatch):
+        urls = []
+
+        def fake(url, headers=None, timeout=15.0, retries=3):
+            urls.append(url)
+            if "rdap.org" in url:
+                return load_fixture("rdap_domain_example.json")
+            raise AssertionError("bootstrap should be skipped: " + url)
+
+        monkeypatch.setattr(recon, "http_get_json", fake)
+        res = recon.fetch_rdap("example.io", use_bootstrap=False)
+        assert res["rdap_source"] == "rdap.org"
+        assert not any("data.iana.org" in u for u in urls)
+        assert not any("identitydigital" in u for u in urls)
+
+    def test_ip_and_asn_still_use_rdap_org(self, monkeypatch):
+        # bootstrap is domain-only; IP/ASN keep the rdap.org path (verified live).
+        seen = []
+
+        def fake(url, headers=None, timeout=15.0, retries=3):
+            seen.append(url)
+            if "/ip/" in url:
+                return load_fixture("rdap_ip_8888.json")
+            raise AssertionError("unexpected url: " + url)
+
+        monkeypatch.setattr(recon, "http_get_json", fake)
+        res = recon.fetch_rdap("8.8.8.8")
+        assert res["rdap_source"] == "rdap.org"
+        assert any("rdap.org/ip/" in u for u in seen)

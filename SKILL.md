@@ -1,7 +1,7 @@
 ---
 name: domain-recon
 description: Passive domain/infra OSINT over five keyless public APIs — subdomains, RDAP/WHOIS, DNS-over-HTTPS, IP geo/ISP, and ASN/prefix ownership.
-metadata: {"openclaw": {"requires": {"bins": ["python3"]}, "emoji": "🛰️"}, "homepage": "https://github.com/maggiedev-bot/domain-recon", "version": "0.2.0"}
+metadata: {"openclaw": {"requires": {"bins": ["python3"]}, "emoji": "🛰️"}, "homepage": "https://github.com/maggiedev-bot/domain-recon", "version": "0.3.0"}
 ---
 
 # domain-recon
@@ -28,8 +28,8 @@ readable summary.
 
 | Subcommand | Source | What it does |
 |------------|--------|--------------|
-| `certs <domain>`   | crt.sh (Certificate Transparency) | Enumerate subdomains + certificate history |
-| `rdap <resource>`  | rdap.org | Modern WHOIS for a domain, IP, or ASN (auto-detected) |
+| `certs <domain>`   | crt.sh + certSpotter (Certificate Transparency) | Enumerate subdomains + certificate history; falls back to certSpotter when crt.sh is down |
+| `rdap <resource>`  | IANA bootstrap + supplement → authoritative server (rdap.org fallback) | Modern WHOIS for a domain, IP, or ASN (auto-detected); resolves ccTLDs like `.ai` (bootstrap) and `.io`/`.sh`/`.ac`/`.us` (supplement) that rdap.org 404s |
 | `dns <name>`       | Google / Cloudflare DoH | Resolve DNS records (A, AAAA, MX, TXT, NS, CNAME, SOA, CAA) |
 | `ip <ip>`          | ip-api.com | IP → geo, ISP, ASN, and proxy/hosting flags |
 | `asn <resource>`   | RIPEstat Data API | ASN → holder + announced prefixes; IP → owning ASN + prefix |
@@ -47,6 +47,8 @@ readable summary.
 - `rdap --kind domain|ip|asn` — force the resource kind instead of auto-detecting.
 - `asn --no-prefixes` — skip the announced-prefixes list for a faster ASN lookup.
 - `certs --limit <n>` / `certs --max-certs <n>` — cap the returned subdomains / cert-history rows (full counts still reported).
+- `certs --all-ct` — query **both** CT sources (crt.sh + certSpotter) and merge, instead of stopping at the first that answers (wider coverage).
+- `rdap --no-bootstrap` — skip the IANA bootstrap and query rdap.org directly (domains only).
 - `wayback --no-cdx` — availability only; `wayback --cdx-limit <n>` — number of recent captures to list.
 - `profile --cert-limit <n>` / `--resolve-limit <n>` / `--ip-limit <n>` — bound how much of each stage the orchestrator pulls; `--no-wayback` to skip the archive step.
 
@@ -95,6 +97,13 @@ returns one merged JSON/`--human` report.
 - **Courteous.** Sends a descriptive User-Agent, uses per-request timeouts, and
   backs off with retries on `429`/`5xx` (honoring `Retry-After`). ip-api.com is
   rate-limited to 45 requests/minute — batch and space out calls.
+- **Resilient to source outages.** `certs` falls back from crt.sh (which
+  frequently hard-`502`s under load) to certSpotter so subdomain enumeration
+  survives, recording which source answered in `sources_used`. `rdap` resolves
+  the authoritative RDAP server via the **IANA bootstrap**, plus a small curated
+  **supplement** for TLDs IANA omits but that still run RDAP (e.g. `.io`, which
+  the rdap.org redirector `404`s), then falls back to rdap.org for anything else.
+  The winning source is recorded in `rdap_source`.
 - **Exit codes:** `0` success, `2` on a handled error (bad input, upstream
   failure) with a message on stderr.
 
