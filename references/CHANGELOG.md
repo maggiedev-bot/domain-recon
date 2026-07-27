@@ -1,5 +1,29 @@
 # Changelog / Design decisions — domain-recon
 
+## 0.4.1 — send the RFC 7480 RDAP Accept header
+
+Exercising `rdap` against a verified target domain for all 1,438 TLDs surfaced a
+real bug: **23 gTLD registry RDAP servers reject `Accept: application/json` with
+HTTP 406** (`.cat`, `.barcelona`, `.sap`, `.aco`, `.seat`, `.eus`, `.gmx`, …).
+
+### Fixed
+- All RDAP requests now send **`Accept: application/rdap+json, application/json`**
+  (RFC 7480 §4.2 — RDAP's registered media type; plain JSON kept as a lenient
+  fallback). Verified live: the 406 servers now return 200. Applies to the
+  authoritative-server, supplement, rdap.org-redirector, and IP/ASN RDAP paths,
+  plus the bootstrap fetch. Offline suite 125 → **126** (new
+  `test_rdap_requests_send_rdap_accept_header`).
+
+### Verified (not code changes)
+- Full `rdap`-per-TLD sweep: **849 PASS + 23 FIXED + 215 GRACEFUL** correct;
+  **0 crashes / malformed output** across 1,433 diverse inputs (every result was
+  real data, a clean `unsupported` graceful signal, or a clean exit-2 error).
+- **13 genuine registry-side known-issues** (self-signed/untrusted TLS on
+  `rdap.nic.xxx`/`.cr`/`.chase`/… , TWNIC HTTP 426, a couple of registry 404/
+  timeout edges): recon errors cleanly; these are upstream, not ours to "fix"
+  (disabling TLS verification would be a security regression). See
+  `docs/tld-target-test-results.md`.
+
 ## 0.4.0 — RDAP graceful degradation + full per-TLD coverage map
 
 An agent calling `rdap` on a domain whose registry runs no public RDAP server

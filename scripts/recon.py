@@ -30,7 +30,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 USER_AGENT = "domain-recon/{v} (+https://github.com/maggiedev-bot/domain-recon)".format(v=__version__)
 
@@ -552,6 +552,12 @@ def parse_rdap(obj, kind: str) -> dict:
 # fall back to rdap.org only when the TLD is absent from the registry.
 _RDAP_BOOTSTRAP_URL = "https://data.iana.org/rdap/dns.json"
 
+# RFC 7480 §4.2: RDAP servers serve the `application/rdap+json` media type. Some
+# strict registry servers (e.g. rdap.nic.cat / .aco / .barcelona) reject a plain
+# `application/json` Accept with HTTP 406, so RDAP requests must ask for the RDAP
+# type first (json kept as a lenient fallback for servers that only speak it).
+_RDAP_ACCEPT = "application/rdap+json, application/json"
+
 # Process-lifetime memo of the parsed {tld: base_url} map (fetched at most once
 # per run). Reset between tests via recon._RDAP_BOOTSTRAP_CACHE.clear().
 _RDAP_BOOTSTRAP_CACHE: "dict[str, dict]" = {}
@@ -631,7 +637,7 @@ def _load_rdap_bootstrap(timeout: float, retries: int) -> dict:
     cached = _RDAP_BOOTSTRAP_CACHE.get("dns")
     if cached is not None:
         return cached
-    mapping = parse_rdap_bootstrap(http_get_json(_RDAP_BOOTSTRAP_URL, timeout=timeout, retries=retries))
+    mapping = parse_rdap_bootstrap(http_get_json(_RDAP_BOOTSTRAP_URL, headers={"Accept": _RDAP_ACCEPT}, timeout=timeout, retries=retries))
     _RDAP_BOOTSTRAP_CACHE["dns"] = mapping
     return mapping
 
@@ -686,14 +692,14 @@ def _fetch_rdap_domain(domain: str, timeout: float, retries: int, use_bootstrap:
         base, origin, bootstrap_ok = _rdap_base_for_domain(domain, timeout, retries)
         if base:
             try:
-                return http_get_json(base, timeout=timeout, retries=retries), origin
+                return http_get_json(base, headers={"Accept": _RDAP_ACCEPT}, timeout=timeout, retries=retries), origin
             except ReconError:
                 pass  # authoritative server failed -> try the redirector
         elif bootstrap_ok:
             # TLD authoritatively absent from bootstrap + supplement: no coverage.
             return None, "none"
     url = "https://rdap.org/domain/{}".format(urllib.parse.quote(domain, safe=""))
-    return http_get_json(url, timeout=timeout, retries=retries), "rdap.org"
+    return http_get_json(url, headers={"Accept": _RDAP_ACCEPT}, timeout=timeout, retries=retries), "rdap.org"
 
 
 def _rdap_unsupported(resource: str, kind: str, domain: str) -> dict:
@@ -730,12 +736,12 @@ def fetch_rdap(resource: str, kind: "str | None" = None, timeout=20.0, retries=3
     elif kind == "ip":
         ip = normalize_ip(resource)
         url = "https://rdap.org/ip/{}".format(urllib.parse.quote(ip, safe=""))
-        obj = http_get_json(url, timeout=timeout, retries=retries)
+        obj = http_get_json(url, headers={"Accept": _RDAP_ACCEPT}, timeout=timeout, retries=retries)
         rdap_source = "rdap.org"
     elif kind == "asn":
         asn = normalize_asn(resource)
         url = "https://rdap.org/autnum/{}".format(asn)
-        obj = http_get_json(url, timeout=timeout, retries=retries)
+        obj = http_get_json(url, headers={"Accept": _RDAP_ACCEPT}, timeout=timeout, retries=retries)
         rdap_source = "rdap.org"
     else:
         raise InputError("unknown RDAP kind: {!r}".format(kind))

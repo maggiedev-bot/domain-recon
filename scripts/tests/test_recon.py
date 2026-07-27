@@ -244,6 +244,20 @@ class TestRdap:
         assert "/ip/" in captured["url"]
         assert res["kind"] == "ip"
 
+    def test_rdap_requests_send_rdap_accept_header(self, monkeypatch):
+        # RFC 7480: RDAP servers serve application/rdap+json; some (nic.cat/.aco)
+        # reject a plain application/json Accept with HTTP 406. The RDAP path must
+        # ask for the rdap+json media type.
+        captured = {}
+
+        def fake(url, headers=None, timeout=15.0, retries=3):
+            captured["headers"] = headers or {}
+            return load_fixture("rdap_ip_8888.json")
+
+        monkeypatch.setattr(recon, "http_get_json", fake)
+        recon.fetch_rdap("8.8.8.8")
+        assert "rdap+json" in captured["headers"].get("Accept", "")
+
     def test_fetch_autodetects_asn(self, monkeypatch):
         obj = load_fixture("rdap_asn_15169.json")
         captured = {}
