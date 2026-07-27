@@ -30,7 +30,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 
 USER_AGENT = "domain-recon/{v} (+https://github.com/maggiedev-bot/domain-recon)".format(v=__version__)
 
@@ -567,6 +567,30 @@ _RDAP_SUPPLEMENT = {
     "sh": "https://rdap.identitydigital.services/rdap",
     "ac": "https://rdap.identitydigital.services/rdap",
     "us": "https://rdap.nic.us",
+    # DENIC runs a public RDAP server for .de but does not publish it to IANA's
+    # bootstrap, so rdap.org 404s .de. Verified HTTP 200 with real registration
+    # data (status/nameservers/events) for google.de on 2026-07-26.
+    "de": "https://rdap.denic.de",
+    # ccTLD registries that run a public RDAP server absent from IANA's bootstrap.
+    # Each verified live on 2026-07-27 with a two-part check: HTTP 200 + real RDAP
+    # data for the registry's own domain, AND a clean 404 (not a connection error)
+    # for a bogus name in the same TLD — i.e. a genuine general-purpose server, not
+    # a one-off. Bootstrap always wins when it later covers any of these, so only
+    # TLDs *genuinely omitted* from the bootstrap are listed here (e.g. .ch/.nl/.no
+    # are already in the bootstrap and are intentionally NOT duplicated).
+    "ch": "https://rdap.nic.ch",  # SWITCH (Switzerland)
+    "af": "https://rdap.nic.af",
+    "aw": "https://rdap.nic.aw",
+    "ci": "https://rdap.nic.ci",
+    "ga": "https://rdap.nic.ga",
+    "kn": "https://rdap.nic.kn",
+    "kz": "https://rdap.nic.kz",
+    "mr": "https://rdap.nic.mr",
+    "mz": "https://rdap.nic.mz",
+    "sb": "https://rdap.nic.sb",
+    "so": "https://rdap.nic.so",
+    "td": "https://rdap.nic.td",
+    "tl": "https://rdap.nic.tl",
 }
 
 
@@ -615,16 +639,25 @@ def _load_rdap_bootstrap(timeout: float, retries: int) -> dict:
 def _rdap_base_for_domain(domain: str, timeout: float, retries: int):
     """Resolve the authoritative RDAP domain URL for `domain`.
 
-    Returns (url, origin) where origin is 'iana-bootstrap' or 'supplement', or
-    (None, None) if the TLD is in neither the IANA registry nor the curated
-    supplement. The bootstrap is consulted first; the supplement fills only the
-    gaps IANA leaves (e.g. `.io`), and still applies if the bootstrap itself is
-    unreachable.
+    Returns (url, origin, bootstrap_ok):
+      * url    — the authoritative RDAP domain URL, or None if the TLD is in
+                 neither the IANA bootstrap nor the curated supplement.
+      * origin — 'iana-bootstrap' or 'supplement', or None when url is None.
+      * bootstrap_ok — True if the IANA bootstrap was successfully consulted
+                 (so *absence* of the TLD from it is authoritative — the basis
+                 for the "unsupported" signal), False if the bootstrap itself
+                 was unreachable (absence is then inconclusive → fall through
+                 to rdap.org rather than claiming the TLD is unsupported).
+
+    The bootstrap is consulted first; the supplement fills only the gaps IANA
+    leaves (e.g. `.io`), and still applies if the bootstrap itself is unreachable.
     """
     tld = domain.rsplit(".", 1)[-1]
     base, origin = None, None
+    bootstrap_ok = False
     try:
         mapping = _load_rdap_bootstrap(timeout, retries)
+        bootstrap_ok = True
         if tld in mapping:
             base, origin = mapping[tld], "iana-bootstrap"
     except ReconError:
@@ -632,26 +665,58 @@ def _rdap_base_for_domain(domain: str, timeout: float, retries: int):
     if base is None and tld in _RDAP_SUPPLEMENT:
         base, origin = _RDAP_SUPPLEMENT[tld], "supplement"
     if base is None:
-        return None, None
-    return "{b}/domain/{d}".format(b=base.rstrip("/"), d=urllib.parse.quote(domain, safe="")), origin
+        return None, None, bootstrap_ok
+    return "{b}/domain/{d}".format(b=base.rstrip("/"), d=urllib.parse.quote(domain, safe="")), origin, bootstrap_ok
 
 
 def _fetch_rdap_domain(domain: str, timeout: float, retries: int, use_bootstrap: bool = True):
     """Fetch a domain RDAP object, preferring the authoritative server.
 
     Returns (obj, rdap_source). Tries the bootstrap/supplement-resolved
-    authoritative server first; on any failure (or an unmapped TLD, or bootstrap
-    disabled) falls back to the rdap.org redirector.
+    authoritative server first; on any failure falls back to the rdap.org
+    redirector. When the IANA bootstrap was consulted successfully but the TLD
+    is absent from it *and* the curated supplement, no public RDAP server
+    exists for that TLD — rdap.org (a bootstrap-backed redirector) would only
+    404 — so we return (None, "none") to signal a first-class "unsupported"
+    result rather than a spurious error. (With bootstrap disabled or the
+    bootstrap unreachable, we cannot make that determination, so we still fall
+    back to rdap.org.)
     """
     if use_bootstrap:
-        base, origin = _rdap_base_for_domain(domain, timeout, retries)
+        base, origin, bootstrap_ok = _rdap_base_for_domain(domain, timeout, retries)
         if base:
             try:
                 return http_get_json(base, timeout=timeout, retries=retries), origin
             except ReconError:
                 pass  # authoritative server failed -> try the redirector
+        elif bootstrap_ok:
+            # TLD authoritatively absent from bootstrap + supplement: no coverage.
+            return None, "none"
     url = "https://rdap.org/domain/{}".format(urllib.parse.quote(domain, safe=""))
     return http_get_json(url, timeout=timeout, retries=retries), "rdap.org"
+
+
+def _rdap_unsupported(resource: str, kind: str, domain: str) -> dict:
+    """Build a first-class 'RDAP not supported for this TLD' result.
+
+    This is a *capability gap*, not a failure: the registry runs no public RDAP
+    server, so there is nothing to retry. A caller (agent) should read
+    `supported is False` / `rdap_source == "none"` and simply skip the field.
+    """
+    tld = domain.rsplit(".", 1)[-1]
+    return {
+        "source": "rdap",
+        "kind": kind,
+        "target": resource,
+        "supported": False,
+        "rdap_source": "none",
+        "tld": tld,
+        "reason": (
+            "no public RDAP server for .{tld} (absent from the IANA RDAP "
+            "bootstrap and the curated supplement; the registry is likely "
+            "WHOIS-only)".format(tld=tld)
+        ),
+    }
 
 
 def fetch_rdap(resource: str, kind: "str | None" = None, timeout=20.0, retries=3, use_bootstrap=True) -> dict:
@@ -660,6 +725,8 @@ def fetch_rdap(resource: str, kind: "str | None" = None, timeout=20.0, retries=3
     if kind == "domain":
         d = normalize_domain(resource)
         obj, rdap_source = _fetch_rdap_domain(d, timeout, retries, use_bootstrap=use_bootstrap)
+        if rdap_source == "none":
+            return _rdap_unsupported(resource, kind, d)
     elif kind == "ip":
         ip = normalize_ip(resource)
         url = "https://rdap.org/ip/{}".format(urllib.parse.quote(ip, safe=""))
@@ -675,6 +742,7 @@ def fetch_rdap(resource: str, kind: "str | None" = None, timeout=20.0, retries=3
     res = parse_rdap(obj, kind)
     res["target"] = resource
     res["rdap_source"] = rdap_source
+    res["supported"] = True
     return res
 
 
@@ -1189,7 +1257,14 @@ def render_human(result: dict) -> str:
         for err in result.get("errors") or []:
             lines.append("  ! {} unavailable: {}".format(err["source"], err["error"]))
     elif src == "rdap":
-        lines.append("RDAP ({}) — {}".format(result["kind"], result.get("handle")))
+        if result.get("supported") is False:
+            lines.append("RDAP ({}) — unsupported for .{}".format(result.get("kind"), result.get("tld")))
+            lines.append("  {}".format(result.get("reason")))
+            return "\n".join(lines)
+        # Some registries redact the top-level handle (e.g. .io/.de); fall back to
+        # the domain/name/target so the header never reads "— None".
+        title = result.get("handle") or result.get("ldhName") or result.get("name") or result.get("target")
+        lines.append("RDAP ({}) — {}".format(result["kind"], title))
         for k in ("ldhName", "name", "startAddress", "endAddress", "country", "startAutnum", "endAutnum", "dnssec"):
             if result.get(k) is not None:
                 lines.append("  {}: {}".format(k, result[k]))
@@ -1265,7 +1340,9 @@ def _render_profile(result: dict) -> str:
     lines = ["profile — {}".format(apex)]
 
     rdap = (result.get("apex") or {}).get("rdap")
-    if rdap:
+    if rdap and rdap.get("supported") is False:
+        lines.append("  rdap: unsupported (.{} has no public RDAP server)".format(rdap.get("tld")))
+    elif rdap:
         reg = (rdap.get("events") or {}).get("registration")
         ns = ", ".join(rdap.get("nameservers") or [])
         lines.append("  registration: {}".format(reg))

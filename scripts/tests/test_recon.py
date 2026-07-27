@@ -967,17 +967,19 @@ class TestRdapBootstrap:
     def test_base_via_bootstrap_for_ai(self, monkeypatch):
         # .ai IS in the bootstrap -> authoritative server, origin 'iana-bootstrap'
         monkeypatch.setattr(recon, "http_get_json", lambda url, **k: load_fixture("rdap_bootstrap_dns.json"))
-        base, origin = recon._rdap_base_for_domain("example.ai", 5, 1)
+        base, origin, bootstrap_ok = recon._rdap_base_for_domain("example.ai", 5, 1)
         assert origin == "iana-bootstrap"
         assert base == "https://rdap.identitydigital.services/rdap/domain/example.ai"
+        assert bootstrap_ok is True
 
     def test_base_via_supplement_for_io(self, monkeypatch):
         # .io is NOT in the bootstrap -> the curated supplement resolves it. This
         # is the exact reported case (rdap.org 404s .io).
         monkeypatch.setattr(recon, "http_get_json", lambda url, **k: load_fixture("rdap_bootstrap_dns.json"))
-        base, origin = recon._rdap_base_for_domain("example.io", 5, 1)
+        base, origin, bootstrap_ok = recon._rdap_base_for_domain("example.io", 5, 1)
         assert origin == "supplement"
         assert base == "https://rdap.identitydigital.services/rdap/domain/example.io"
+        assert bootstrap_ok is True
 
     def test_supplement_works_even_if_bootstrap_unreachable(self, monkeypatch):
         # bootstrap down, but .io is in the supplement -> still resolves.
@@ -985,14 +987,19 @@ class TestRdapBootstrap:
             recon, "http_get_json",
             lambda url, **k: (_ for _ in ()).throw(recon.NetworkError("iana down")),
         )
-        base, origin = recon._rdap_base_for_domain("example.io", 5, 1)
+        base, origin, bootstrap_ok = recon._rdap_base_for_domain("example.io", 5, 1)
         assert origin == "supplement"
         assert "identitydigital" in base
+        assert bootstrap_ok is False  # bootstrap was unreachable; supplement carried it
 
     def test_base_none_for_unmapped_tld(self, monkeypatch):
+        # Bootstrap reachable + TLD absent everywhere -> no base, but bootstrap_ok
+        # is True: absence is authoritative, which lets fetch_rdap report the TLD
+        # as unsupported rather than blindly hitting rdap.org for a 404.
         monkeypatch.setattr(recon, "http_get_json", lambda url, **k: load_fixture("rdap_bootstrap_dns.json"))
-        base, origin = recon._rdap_base_for_domain("example.zzz", 5, 1)
+        base, origin, bootstrap_ok = recon._rdap_base_for_domain("example.zzz", 5, 1)
         assert base is None and origin is None
+        assert bootstrap_ok is True
 
     def test_bootstrap_is_cached(self, monkeypatch):
         calls = {"n": 0}
@@ -1043,20 +1050,45 @@ class TestRdapBootstrap:
         assert any("identitydigital" in u for u in urls)
         assert not any("rdap.org" in u for u in urls)
 
-    def test_fetch_unmapped_tld_falls_back_to_rdap_org(self, monkeypatch):
+    def test_fetch_unmapped_tld_when_bootstrap_ok_is_unsupported(self, monkeypatch):
+        # Bootstrap reachable + TLD absent from bootstrap AND supplement -> the
+        # registry has no public RDAP server. rdap.org (bootstrap-backed) would
+        # only 404, so we return a first-class 'unsupported' result and never
+        # touch the redirector.
         urls = []
 
         def fake(url, headers=None, timeout=15.0, retries=3):
             urls.append(url)
             if "data.iana.org" in url:
                 return load_fixture("rdap_bootstrap_dns.json")
+            raise AssertionError("should not fetch anything beyond the bootstrap: " + url)
+
+        monkeypatch.setattr(recon, "http_get_json", fake)
+        res = recon.fetch_rdap("example.zzz")  # .zzz in neither bootstrap nor supplement
+        assert res["supported"] is False
+        assert res["rdap_source"] == "none"
+        assert res["kind"] == "domain"
+        assert res["tld"] == "zzz"
+        assert "zzz" in res["reason"]
+        assert not any("rdap.org" in u for u in urls)  # no spurious 404 fetch
+
+    def test_fetch_unmapped_tld_bootstrap_unreachable_falls_back_to_rdap_org(self, monkeypatch):
+        # Bootstrap UNREACHABLE + TLD not in supplement -> absence is
+        # inconclusive, so we must not claim 'unsupported'; fall back to rdap.org.
+        urls = []
+
+        def fake(url, headers=None, timeout=15.0, retries=3):
+            urls.append(url)
+            if "data.iana.org" in url:
+                raise recon.NetworkError("iana down")
             if "rdap.org" in url:
                 return load_fixture("rdap_domain_example.json")
             raise AssertionError("unexpected url: " + url)
 
         monkeypatch.setattr(recon, "http_get_json", fake)
-        res = recon.fetch_rdap("example.zzz")  # .zzz in neither bootstrap nor supplement
+        res = recon.fetch_rdap("example.zzz")
         assert res["rdap_source"] == "rdap.org"
+        assert res["supported"] is True
         assert any("rdap.org/domain" in u for u in urls)
 
     def test_bootstrap_unreachable_io_still_uses_supplement(self, monkeypatch):
@@ -1114,3 +1146,96 @@ class TestRdapBootstrap:
         res = recon.fetch_rdap("8.8.8.8")
         assert res["rdap_source"] == "rdap.org"
         assert any("rdap.org/ip/" in u for u in seen)
+
+
+# ---------------------------------------------------------------------------
+# RDAP graceful degradation: 'unsupported' is a first-class result, not an error
+# ---------------------------------------------------------------------------
+
+
+class TestRdapUnsupported:
+    @pytest.fixture(autouse=True)
+    def _clear_cache(self):
+        recon._RDAP_BOOTSTRAP_CACHE.clear()
+        yield
+        recon._RDAP_BOOTSTRAP_CACHE.clear()
+
+    def test_builder_shape(self):
+        res = recon._rdap_unsupported("example.zzz", "domain", "example.zzz")
+        assert res["source"] == "rdap"
+        assert res["kind"] == "domain"
+        assert res["target"] == "example.zzz"
+        assert res["supported"] is False
+        assert res["rdap_source"] == "none"
+        assert res["tld"] == "zzz"
+        assert "zzz" in res["reason"]
+
+    def test_supported_flag_present_on_normal_result(self, monkeypatch):
+        # The contract is symmetric: a real answer carries supported=True so a
+        # caller can branch on a single field.
+        def fake(url, headers=None, timeout=15.0, retries=3):
+            if "data.iana.org" in url:
+                return load_fixture("rdap_bootstrap_dns.json")
+            if "identitydigital" in url:
+                return load_fixture("rdap_domain_example.json")
+            raise AssertionError("unexpected url: " + url)
+
+        monkeypatch.setattr(recon, "http_get_json", fake)
+        res = recon.fetch_rdap("example.ai")
+        assert res["supported"] is True
+
+    def test_no_bootstrap_flag_never_reports_unsupported(self, monkeypatch):
+        # With the bootstrap disabled we cannot know a TLD is unsupported, so we
+        # must fall back to rdap.org, never emit a false 'unsupported'.
+        def fake(url, headers=None, timeout=15.0, retries=3):
+            if "rdap.org" in url:
+                return load_fixture("rdap_domain_example.json")
+            raise AssertionError("bootstrap should be skipped: " + url)
+
+        monkeypatch.setattr(recon, "http_get_json", fake)
+        res = recon.fetch_rdap("example.zzz", use_bootstrap=False)
+        assert res["rdap_source"] == "rdap.org"
+        assert res["supported"] is True
+
+    def test_human_render_unsupported(self):
+        res = recon._rdap_unsupported("example.zzz", "domain", "example.zzz")
+        out = recon.render_human(res)
+        assert "unsupported for .zzz" in out
+        assert "no public RDAP server" in out
+        # must NOT print the misleading "RDAP (domain) — None" header
+        assert "— None" not in out
+
+    def test_human_render_redacted_handle_falls_back_to_name(self):
+        # Registries like .io/.de redact the top-level handle; the header must
+        # fall back to the domain, never print "RDAP (domain) — None" (roadmap #3).
+        res = {"source": "rdap", "kind": "domain", "supported": True, "handle": None,
+               "ldhName": "groupvault.io", "target": "groupvault.io", "events": {}, "status": []}
+        out = recon.render_human(res)
+        assert "RDAP (domain) — groupvault.io" in out
+        assert "— None" not in out
+
+    def test_profile_unsupported_rdap_is_not_an_error(self, monkeypatch):
+        # An unsupported-TLD apex must degrade gracefully inside profile: a clean
+        # structured signal under apex.rdap, and NOT an entry in errors[].
+        resolve_map = {}
+        _install_profile_fakes(monkeypatch, resolve_map)
+        monkeypatch.setattr(
+            recon, "fetch_rdap",
+            lambda *a, **k: recon._rdap_unsupported("example.zzz", "domain", "example.zzz"),
+        )
+        rep = recon.run_profile("example.zzz")
+        assert rep["apex"]["rdap"]["supported"] is False
+        assert rep["apex"]["rdap"]["rdap_source"] == "none"
+        assert not any(e["step"] == "rdap" for e in rep["errors"])
+
+    def test_profile_human_render_unsupported_rdap(self, monkeypatch):
+        resolve_map = {}
+        _install_profile_fakes(monkeypatch, resolve_map)
+        monkeypatch.setattr(
+            recon, "fetch_rdap",
+            lambda *a, **k: recon._rdap_unsupported("example.zzz", "domain", "example.zzz"),
+        )
+        rep = recon.run_profile("example.zzz")
+        out = recon.render_human(rep)
+        assert "rdap: unsupported" in out
+        assert "registration: None" not in out

@@ -1,5 +1,51 @@
 # Changelog / Design decisions — domain-recon
 
+## 0.4.0 — RDAP graceful degradation + full per-TLD coverage map
+
+An agent calling `rdap` on a domain whose registry runs no public RDAP server
+previously got an opaque `rdap.org` 404 that *looked* like the tool was broken.
+`rdap` is the only TLD-variable query — `dns`/`certs`/`ip`/`asn`/`wayback` are
+TLD-agnostic — so this only affects RDAP, but it affected it confusingly.
+
+### Added
+- **First-class `unsupported` RDAP result (graceful degradation).** When the
+  IANA bootstrap is consulted successfully and the TLD is absent from *both* the
+  bootstrap and the curated supplement, no public RDAP server exists — rdap.org
+  (a bootstrap-backed redirector) would only 404 — so `rdap` now returns
+  `{"supported": false, "rdap_source": "none", "tld": ..., "reason": ...}` at
+  **exit 0** instead of erroring. A caller reads one field (`supported`) and
+  skips RDAP for that TLD while still using the other sources. Real answers now
+  carry `"supported": true` symmetrically. Inside `profile`, an unsupported apex
+  RDAP is a clean signal under `apex.rdap`, **not** an entry in `errors[]`.
+  - Three cases are now distinguishable: *supported+answered*, *supported but
+    transiently down* (5xx/timeout → `errors[]`/fallback, retryable), and
+    *unsupported for this TLD* (permanent capability gap, not an error).
+  - Bootstrap **unreachable** ≠ unsupported: if the bootstrap itself can't be
+    fetched we fall back to rdap.org rather than falsely claim "unsupported".
+    `--no-bootstrap` likewise never emits `unsupported`.
+- **`docs/tld-rdap-coverage.md`** — a per-TLD RDAP coverage map over all 1,438
+  IANA-delegated TLDs (`TLD | rdap_source | notes` + summary counts), plus
+  **`scripts/gen_coverage.py`** to regenerate it from authoritative IANA data.
+  Current split: **1,200 bootstrap / 18 supplement / 220 none.**
+- **13 ccTLDs added to `_RDAP_SUPPLEMENT`** (`ch, af, aw, ci, ga, kn, kz, mr,
+  mz, sb, so, td, tl`) — registries that run a public RDAP server IANA omits.
+  Each verified live 2026-07-27 with a two-part check: HTTP 200 + real RDAP data
+  for the registry's own domain **and** a clean 404 for a bogus name in the same
+  TLD (proving a genuine general-purpose server, not a one-off). Candidates that
+  turned out to be *already in the bootstrap* (`.br/.cz/.nl/.no/.pl`) were **not**
+  duplicated — bootstrap always wins.
+
+### Fixed
+- `rdap <domain> --human` no longer prints `RDAP (domain) — None` when a registry
+  redacts the top-level `handle` (e.g. `.io`/`.de`); the header falls back to the
+  domain name (prior roadmap item #3).
+
+### Tests
+- Offline suite 117 → **124**: unsupported builder shape, `supported` flag on
+  normal results, bootstrap-known-absent → unsupported (no spurious rdap.org
+  fetch), bootstrap-unreachable → rdap.org fallback, `--no-bootstrap` never
+  reports unsupported, `--human` + `profile` rendering of the unsupported case.
+
 ## 0.3.1 — bound the Wayback step so `profile` can't read as hung
 
 Live QA (2026-07-26) ran the full surface against `groupvault.io` and

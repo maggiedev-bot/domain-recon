@@ -1,7 +1,7 @@
 ---
 name: domain-recon
 description: Passive domain/infra OSINT over five keyless public APIs — subdomains, RDAP/WHOIS, DNS-over-HTTPS, IP geo/ISP, and ASN/prefix ownership.
-metadata: {"openclaw": {"requires": {"bins": ["python3"]}, "emoji": "🛰️"}, "homepage": "https://github.com/maggiedev-bot/domain-recon", "version": "0.3.1"}
+metadata: {"openclaw": {"requires": {"bins": ["python3"]}, "emoji": "🛰️"}, "homepage": "https://github.com/maggiedev-bot/domain-recon", "version": "0.4.0"}
 ---
 
 # domain-recon
@@ -104,6 +104,18 @@ returns one merged JSON/`--human` report.
   **supplement** for TLDs IANA omits but that still run RDAP (e.g. `.io`, which
   the rdap.org redirector `404`s), then falls back to rdap.org for anything else.
   The winning source is recorded in `rdap_source`.
+- **Graceful degradation — `rdap` tells you when a TLD isn't supported.** `rdap`
+  is the only TLD-variable query (dns/certs/ip/asn/wayback are TLD-agnostic).
+  When a domain's TLD has no public RDAP server anywhere (absent from both the
+  IANA bootstrap and the supplement — many ccTLDs are WHOIS-only), `rdap` returns
+  a first-class **`{"supported": false, "rdap_source": "none", "reason": ...}`**
+  result at exit `0`, *not* a 404 or an exception. A calling agent should check
+  `supported` and skip RDAP for that domain while still using the other sources;
+  inside `profile` this appears as a clean signal under `apex.rdap`, never in
+  `errors[]`. Real answers carry `"supported": true`. See
+  `docs/tld-rdap-coverage.md` for the full per-TLD map (which of the 1,438
+  delegated TLDs are `bootstrap` / `supplement` / `none`), regenerable with
+  `python3 {baseDir}/scripts/gen_coverage.py`.
 - **`profile` runtime is bounded, not instant.** A full profile fans out across
   ~6 sources and multiple hosts with courtesy rate-limit spacing, so a large
   domain (dozens of subdomains) takes roughly **1–1.5 min** — it is working, not
