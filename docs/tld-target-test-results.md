@@ -52,6 +52,8 @@ The first full sweep ran 1,433 lookups with high concurrency, which tripped an *
 
 These 333 TLDs construct the correct authoritative RDAP URL and are expected to PASS; they can be re-validated once the ~23 h backend cooldown expires. They are **not** counted as passing above because they were not independently re-confirmed this session.
 
+**Resume artifact:** the exact 333 TLDs (with their target domains and a step-by-step how-to-resume) are captured in [`tld-artifact-retry-list.json`](tld-artifact-retry-list.json). Re-run `rdap <target>` for each **one-at-a-time** (polite spacing, honor `Retry-After` — concurrency is what caused the ban), reclassify, and fold results back into this table. The ban is expected to have cleared by ~2026-07-28 00:00 UTC.
+
 ## Full per-TLD results (1433)
 
 | TLD | target | coverage | status |

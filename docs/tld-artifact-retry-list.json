@@ -1,0 +1,1342 @@
+{
+  "purpose": "TLDs whose rdap lookups were NOT independently re-confirmed in the 2026-07-27 sweep because a self-inflicted high-concurrency burst tripped an IP-level rate-limit ban on the shared Identity Digital / CentralNic RDAP backends (HTTP 429, Retry-After ~82000s / ~23h). These are expected to PASS (URL construction is correct); they simply weren't re-confirmed this session.",
+  "status": "pending re-validation",
+  "captured_utc": "2026-07-27T03:00:00Z",
+  "ban_expected_clear_utc": "2026-07-28T00:00:00Z (approx; ~23h after the burst)",
+  "count": 333,
+  "how_to_resume": "Re-run `python3 scripts/recon.py rdap <target>` for each entry ONE-AT-A-TIME with polite spacing (>=1.5s gap, honor Retry-After). Do NOT run concurrently \u2014 concurrency is what caused the ban. Reclassify PASS / graceful-unsupported / FAIL and fold results into docs/tld-target-test-results.md, then drop resolved entries from this file.",
+  "tlds": [
+    {
+      "tld": ".beer",
+      "target": "nic.beer"
+    },
+    {
+      "tld": ".date",
+      "target": "nic.date"
+    },
+    {
+      "tld": ".estate",
+      "target": "nic.estate"
+    },
+    {
+      "tld": ".events",
+      "target": "nic.events"
+    },
+    {
+      "tld": ".exchange",
+      "target": "nic.exchange"
+    },
+    {
+      "tld": ".expert",
+      "target": "nic.expert"
+    },
+    {
+      "tld": ".exposed",
+      "target": "nic.exposed"
+    },
+    {
+      "tld": ".express",
+      "target": "nic.express"
+    },
+    {
+      "tld": ".extraspace",
+      "target": "nic.extraspace"
+    },
+    {
+      "tld": ".fage",
+      "target": "nic.fage"
+    },
+    {
+      "tld": ".fail",
+      "target": "nic.fail"
+    },
+    {
+      "tld": ".family",
+      "target": "nic.family"
+    },
+    {
+      "tld": ".fan",
+      "target": "nic.fan"
+    },
+    {
+      "tld": ".farm",
+      "target": "nic.farm"
+    },
+    {
+      "tld": ".fedex",
+      "target": "nic.fedex"
+    },
+    {
+      "tld": ".ferrari",
+      "target": "nic.ferrari"
+    },
+    {
+      "tld": ".fidelity",
+      "target": "nic.fidelity"
+    },
+    {
+      "tld": ".fido",
+      "target": "nic.fido"
+    },
+    {
+      "tld": ".finance",
+      "target": "nic.finance"
+    },
+    {
+      "tld": ".financial",
+      "target": "nic.financial"
+    },
+    {
+      "tld": ".fish",
+      "target": "nic.fish"
+    },
+    {
+      "tld": ".fitness",
+      "target": "nic.fitness"
+    },
+    {
+      "tld": ".flickr",
+      "target": "nic.flickr"
+    },
+    {
+      "tld": ".flights",
+      "target": "nic.flights"
+    },
+    {
+      "tld": ".florist",
+      "target": "nic.florist"
+    },
+    {
+      "tld": ".football",
+      "target": "nic.football"
+    },
+    {
+      "tld": ".forex",
+      "target": "nic.forex"
+    },
+    {
+      "tld": ".forsale",
+      "target": "nic.forsale"
+    },
+    {
+      "tld": ".frogans",
+      "target": "nic.frogans"
+    },
+    {
+      "tld": ".fund",
+      "target": "nic.fund"
+    },
+    {
+      "tld": ".furniture",
+      "target": "nic.furniture"
+    },
+    {
+      "tld": ".futbol",
+      "target": "nic.futbol"
+    },
+    {
+      "tld": ".fyi",
+      "target": "nic.fyi"
+    },
+    {
+      "tld": ".gallery",
+      "target": "nic.gallery"
+    },
+    {
+      "tld": ".gallo",
+      "target": "nic.gallo"
+    },
+    {
+      "tld": ".gallup",
+      "target": "nic.gallup"
+    },
+    {
+      "tld": ".games",
+      "target": "nic.games"
+    },
+    {
+      "tld": ".genting",
+      "target": "nic.genting"
+    },
+    {
+      "tld": ".gifts",
+      "target": "nic.gifts"
+    },
+    {
+      "tld": ".glass",
+      "target": "nic.glass"
+    },
+    {
+      "tld": ".global",
+      "target": "nic.global"
+    },
+    {
+      "tld": ".gmbh",
+      "target": "nic.gmbh"
+    },
+    {
+      "tld": ".gold",
+      "target": "nic.gold"
+    },
+    {
+      "tld": ".golf",
+      "target": "nic.golf"
+    },
+    {
+      "tld": ".goodyear",
+      "target": "nic.goodyear"
+    },
+    {
+      "tld": ".got",
+      "target": "nic.got"
+    },
+    {
+      "tld": ".graphics",
+      "target": "nic.graphics"
+    },
+    {
+      "tld": ".gratis",
+      "target": "nic.gratis"
+    },
+    {
+      "tld": ".green",
+      "target": "nic.green"
+    },
+    {
+      "tld": ".gripe",
+      "target": "nic.gripe"
+    },
+    {
+      "tld": ".group",
+      "target": "nic.group"
+    },
+    {
+      "tld": ".guide",
+      "target": "nic.guide"
+    },
+    {
+      "tld": ".guru",
+      "target": "nic.guru"
+    },
+    {
+      "tld": ".haus",
+      "target": "nic.haus"
+    },
+    {
+      "tld": ".hdfc",
+      "target": "nic.hdfc"
+    },
+    {
+      "tld": ".hdfcbank",
+      "target": "nic.hdfcbank"
+    },
+    {
+      "tld": ".healthcare",
+      "target": "nic.healthcare"
+    },
+    {
+      "tld": ".helsinki",
+      "target": "nic.helsinki"
+    },
+    {
+      "tld": ".hermes",
+      "target": "nic.hermes"
+    },
+    {
+      "tld": ".hkt",
+      "target": "nic.hkt"
+    },
+    {
+      "tld": ".hockey",
+      "target": "nic.hockey"
+    },
+    {
+      "tld": ".holdings",
+      "target": "nic.holdings"
+    },
+    {
+      "tld": ".holiday",
+      "target": "nic.holiday"
+    },
+    {
+      "tld": ".homedepot",
+      "target": "nic.homedepot"
+    },
+    {
+      "tld": ".hospital",
+      "target": "nic.hospital"
+    },
+    {
+      "tld": ".house",
+      "target": "nic.house"
+    },
+    {
+      "tld": ".hughes",
+      "target": "nic.hughes"
+    },
+    {
+      "tld": ".ice",
+      "target": "nic.ice"
+    },
+    {
+      "tld": ".imamat",
+      "target": "nic.imamat"
+    },
+    {
+      "tld": ".immo",
+      "target": "nic.immo"
+    },
+    {
+      "tld": ".immobilien",
+      "target": "nic.immobilien"
+    },
+    {
+      "tld": ".industries",
+      "target": "nic.industries"
+    },
+    {
+      "tld": ".info",
+      "target": "nic.info"
+    },
+    {
+      "tld": ".institute",
+      "target": "nic.institute"
+    },
+    {
+      "tld": ".insure",
+      "target": "nic.insure"
+    },
+    {
+      "tld": ".international",
+      "target": "nic.international"
+    },
+    {
+      "tld": ".investments",
+      "target": "nic.investments"
+    },
+    {
+      "tld": ".io",
+      "target": "nic.io"
+    },
+    {
+      "tld": ".irish",
+      "target": "nic.irish"
+    },
+    {
+      "tld": ".ismaili",
+      "target": "nic.ismaili"
+    },
+    {
+      "tld": ".ist",
+      "target": "nic.ist"
+    },
+    {
+      "tld": ".istanbul",
+      "target": "nic.istanbul"
+    },
+    {
+      "tld": ".itv",
+      "target": "nic.itv"
+    },
+    {
+      "tld": ".jaguar",
+      "target": "nic.jaguar"
+    },
+    {
+      "tld": ".java",
+      "target": "nic.java"
+    },
+    {
+      "tld": ".jeep",
+      "target": "nic.jeep"
+    },
+    {
+      "tld": ".jetzt",
+      "target": "nic.jetzt"
+    },
+    {
+      "tld": ".jewelry",
+      "target": "nic.jewelry"
+    },
+    {
+      "tld": ".jio",
+      "target": "nic.jio"
+    },
+    {
+      "tld": ".jll",
+      "target": "nic.jll"
+    },
+    {
+      "tld": ".jot",
+      "target": "nic.jot"
+    },
+    {
+      "tld": ".juegos",
+      "target": "nic.juegos"
+    },
+    {
+      "tld": ".juniper",
+      "target": "nic.juniper"
+    },
+    {
+      "tld": ".kaufen",
+      "target": "nic.kaufen"
+    },
+    {
+      "tld": ".kerryhotels",
+      "target": "nic.kerryhotels"
+    },
+    {
+      "tld": ".kerryproperties",
+      "target": "nic.kerryproperties"
+    },
+    {
+      "tld": ".kids",
+      "target": "nic.kids"
+    },
+    {
+      "tld": ".kim",
+      "target": "nic.kim"
+    },
+    {
+      "tld": ".kitchen",
+      "target": "nic.kitchen"
+    },
+    {
+      "tld": ".kosher",
+      "target": "nic.kosher"
+    },
+    {
+      "tld": ".kuokgroup",
+      "target": "nic.kuokgroup"
+    },
+    {
+      "tld": ".lamborghini",
+      "target": "nic.lamborghini"
+    },
+    {
+      "tld": ".lamer",
+      "target": "nic.lamer"
+    },
+    {
+      "tld": ".land",
+      "target": "nic.land"
+    },
+    {
+      "tld": ".landrover",
+      "target": "nic.landrover"
+    },
+    {
+      "tld": ".lasalle",
+      "target": "nic.lasalle"
+    },
+    {
+      "tld": ".latrobe",
+      "target": "nic.latrobe"
+    },
+    {
+      "tld": ".lawyer",
+      "target": "nic.lawyer"
+    },
+    {
+      "tld": ".lds",
+      "target": "nic.lds"
+    },
+    {
+      "tld": ".lease",
+      "target": "nic.lease"
+    },
+    {
+      "tld": ".lefrak",
+      "target": "nic.lefrak"
+    },
+    {
+      "tld": ".legal",
+      "target": "nic.legal"
+    },
+    {
+      "tld": ".lego",
+      "target": "nic.lego"
+    },
+    {
+      "tld": ".lgbt",
+      "target": "nic.lgbt"
+    },
+    {
+      "tld": ".life",
+      "target": "nic.life"
+    },
+    {
+      "tld": ".lighting",
+      "target": "nic.lighting"
+    },
+    {
+      "tld": ".limited",
+      "target": "nic.limited"
+    },
+    {
+      "tld": ".limo",
+      "target": "nic.limo"
+    },
+    {
+      "tld": ".live",
+      "target": "nic.live"
+    },
+    {
+      "tld": ".llc",
+      "target": "nic.llc"
+    },
+    {
+      "tld": ".loans",
+      "target": "nic.loans"
+    },
+    {
+      "tld": ".lotto",
+      "target": "nic.lotto"
+    },
+    {
+      "tld": ".ltd",
+      "target": "nic.ltd"
+    },
+    {
+      "tld": ".ltda",
+      "target": "nic.ltda"
+    },
+    {
+      "tld": ".lundbeck",
+      "target": "nic.lundbeck"
+    },
+    {
+      "tld": ".maif",
+      "target": "nic.maif"
+    },
+    {
+      "tld": ".maison",
+      "target": "nic.maison"
+    },
+    {
+      "tld": ".management",
+      "target": "nic.management"
+    },
+    {
+      "tld": ".market",
+      "target": "nic.market"
+    },
+    {
+      "tld": ".marketing",
+      "target": "nic.marketing"
+    },
+    {
+      "tld": ".markets",
+      "target": "nic.markets"
+    },
+    {
+      "tld": ".marriott",
+      "target": "nic.marriott"
+    },
+    {
+      "tld": ".mba",
+      "target": "nic.mba"
+    },
+    {
+      "tld": ".mckinsey",
+      "target": "nic.mckinsey"
+    },
+    {
+      "tld": ".media",
+      "target": "nic.media"
+    },
+    {
+      "tld": ".memorial",
+      "target": "nic.memorial"
+    },
+    {
+      "tld": ".mit",
+      "target": "nic.mit"
+    },
+    {
+      "tld": ".mobi",
+      "target": "nic.mobi"
+    },
+    {
+      "tld": ".moda",
+      "target": "nic.moda"
+    },
+    {
+      "tld": ".money",
+      "target": "nic.money"
+    },
+    {
+      "tld": ".mormon",
+      "target": "nic.mormon"
+    },
+    {
+      "tld": ".mortgage",
+      "target": "nic.mortgage"
+    },
+    {
+      "tld": ".movie",
+      "target": "nic.movie"
+    },
+    {
+      "tld": ".mu",
+      "target": "nic.mu"
+    },
+    {
+      "tld": ".nab",
+      "target": "nic.nab"
+    },
+    {
+      "tld": ".navy",
+      "target": "nic.navy"
+    },
+    {
+      "tld": ".network",
+      "target": "nic.network"
+    },
+    {
+      "tld": ".news",
+      "target": "nic.news"
+    },
+    {
+      "tld": ".next",
+      "target": "nic.next"
+    },
+    {
+      "tld": ".nextdirect",
+      "target": "nic.nextdirect"
+    },
+    {
+      "tld": ".nikon",
+      "target": "nic.nikon"
+    },
+    {
+      "tld": ".ninja",
+      "target": "nic.ninja"
+    },
+    {
+      "tld": ".nissay",
+      "target": "nic.nissay"
+    },
+    {
+      "tld": ".nowtv",
+      "target": "nic.nowtv"
+    },
+    {
+      "tld": ".nra",
+      "target": "nic.nra"
+    },
+    {
+      "tld": ".obi",
+      "target": "nic.obi"
+    },
+    {
+      "tld": ".onl",
+      "target": "nic.onl"
+    },
+    {
+      "tld": ".oracle",
+      "target": "nic.oracle"
+    },
+    {
+      "tld": ".orange",
+      "target": "nic.orange"
+    },
+    {
+      "tld": ".organic",
+      "target": "nic.organic"
+    },
+    {
+      "tld": ".origins",
+      "target": "nic.origins"
+    },
+    {
+      "tld": ".partners",
+      "target": "nic.partners"
+    },
+    {
+      "tld": ".parts",
+      "target": "nic.parts"
+    },
+    {
+      "tld": ".pccw",
+      "target": "nic.pccw"
+    },
+    {
+      "tld": ".pet",
+      "target": "nic.pet"
+    },
+    {
+      "tld": ".photography",
+      "target": "nic.photography"
+    },
+    {
+      "tld": ".photos",
+      "target": "nic.photos"
+    },
+    {
+      "tld": ".pictet",
+      "target": "nic.pictet"
+    },
+    {
+      "tld": ".pictures",
+      "target": "nic.pictures"
+    },
+    {
+      "tld": ".pink",
+      "target": "nic.pink"
+    },
+    {
+      "tld": ".pizza",
+      "target": "nic.pizza"
+    },
+    {
+      "tld": ".place",
+      "target": "nic.place"
+    },
+    {
+      "tld": ".plumbing",
+      "target": "nic.plumbing"
+    },
+    {
+      "tld": ".plus",
+      "target": "nic.plus"
+    },
+    {
+      "tld": ".pnc",
+      "target": "nic.pnc"
+    },
+    {
+      "tld": ".poker",
+      "target": "nic.poker"
+    },
+    {
+      "tld": ".post",
+      "target": "nic.post"
+    },
+    {
+      "tld": ".praxi",
+      "target": "nic.praxi"
+    },
+    {
+      "tld": ".pro",
+      "target": "nic.pro"
+    },
+    {
+      "tld": ".productions",
+      "target": "nic.productions"
+    },
+    {
+      "tld": ".progressive",
+      "target": "nic.progressive"
+    },
+    {
+      "tld": ".promo",
+      "target": "nic.promo"
+    },
+    {
+      "tld": ".properties",
+      "target": "nic.properties"
+    },
+    {
+      "tld": ".pub",
+      "target": "nic.pub"
+    },
+    {
+      "tld": ".pwc",
+      "target": "nic.pwc"
+    },
+    {
+      "tld": ".recipes",
+      "target": "nic.recipes"
+    },
+    {
+      "tld": ".red",
+      "target": "nic.red"
+    },
+    {
+      "tld": ".redumbrella",
+      "target": "nic.redumbrella"
+    },
+    {
+      "tld": ".rehab",
+      "target": "nic.rehab"
+    },
+    {
+      "tld": ".reise",
+      "target": "nic.reise"
+    },
+    {
+      "tld": ".reisen",
+      "target": "nic.reisen"
+    },
+    {
+      "tld": ".reliance",
+      "target": "nic.reliance"
+    },
+    {
+      "tld": ".rentals",
+      "target": "nic.rentals"
+    },
+    {
+      "tld": ".repair",
+      "target": "nic.repair"
+    },
+    {
+      "tld": ".report",
+      "target": "nic.report"
+    },
+    {
+      "tld": ".republican",
+      "target": "nic.republican"
+    },
+    {
+      "tld": ".restaurant",
+      "target": "nic.restaurant"
+    },
+    {
+      "tld": ".reviews",
+      "target": "nic.reviews"
+    },
+    {
+      "tld": ".rexroth",
+      "target": "nic.rexroth"
+    },
+    {
+      "tld": ".rich",
+      "target": "nic.rich"
+    },
+    {
+      "tld": ".richardli",
+      "target": "nic.richardli"
+    },
+    {
+      "tld": ".ril",
+      "target": "nic.ril"
+    },
+    {
+      "tld": ".rip",
+      "target": "nic.rip"
+    },
+    {
+      "tld": ".rocks",
+      "target": "nic.rocks"
+    },
+    {
+      "tld": ".rogers",
+      "target": "nic.rogers"
+    },
+    {
+      "tld": ".run",
+      "target": "nic.run"
+    },
+    {
+      "tld": ".rwe",
+      "target": "nic.rwe"
+    },
+    {
+      "tld": ".safety",
+      "target": "nic.safety"
+    },
+    {
+      "tld": ".sale",
+      "target": "nic.sale"
+    },
+    {
+      "tld": ".salon",
+      "target": "nic.salon"
+    },
+    {
+      "tld": ".sanofi",
+      "target": "nic.sanofi"
+    },
+    {
+      "tld": ".sarl",
+      "target": "nic.sarl"
+    },
+    {
+      "tld": ".saxo",
+      "target": "nic.saxo"
+    },
+    {
+      "tld": ".sbi",
+      "target": "nic.sbi"
+    },
+    {
+      "tld": ".scholarships",
+      "target": "nic.scholarships"
+    },
+    {
+      "tld": ".school",
+      "target": "nic.school"
+    },
+    {
+      "tld": ".schule",
+      "target": "nic.schule"
+    },
+    {
+      "tld": ".sener",
+      "target": "nic.sener"
+    },
+    {
+      "tld": ".services",
+      "target": "nic.services"
+    },
+    {
+      "tld": ".sew",
+      "target": "nic.sew"
+    },
+    {
+      "tld": ".sex",
+      "target": "nic.sex"
+    },
+    {
+      "tld": ".sh",
+      "target": "nic.sh"
+    },
+    {
+      "tld": ".shangrila",
+      "target": "nic.shangrila"
+    },
+    {
+      "tld": ".shiksha",
+      "target": "nic.shiksha"
+    },
+    {
+      "tld": ".shoes",
+      "target": "nic.shoes"
+    },
+    {
+      "tld": ".shopping",
+      "target": "nic.shopping"
+    },
+    {
+      "tld": ".show",
+      "target": "nic.show"
+    },
+    {
+      "tld": ".singles",
+      "target": "nic.singles"
+    },
+    {
+      "tld": ".ski",
+      "target": "nic.ski"
+    },
+    {
+      "tld": ".soccer",
+      "target": "nic.soccer"
+    },
+    {
+      "tld": ".social",
+      "target": "nic.social"
+    },
+    {
+      "tld": ".software",
+      "target": "nic.software"
+    },
+    {
+      "tld": ".solar",
+      "target": "nic.solar"
+    },
+    {
+      "tld": ".solutions",
+      "target": "nic.solutions"
+    },
+    {
+      "tld": ".song",
+      "target": "nic.song"
+    },
+    {
+      "tld": ".spa",
+      "target": "nic.spa"
+    },
+    {
+      "tld": ".srl",
+      "target": "nic.srl"
+    },
+    {
+      "tld": ".stada",
+      "target": "nic.stada"
+    },
+    {
+      "tld": ".star",
+      "target": "nic.star"
+    },
+    {
+      "tld": ".statebank",
+      "target": "nic.statebank"
+    },
+    {
+      "tld": ".stockholm",
+      "target": "nic.stockholm"
+    },
+    {
+      "tld": ".studio",
+      "target": "nic.studio"
+    },
+    {
+      "tld": ".style",
+      "target": "nic.style"
+    },
+    {
+      "tld": ".supplies",
+      "target": "nic.supplies"
+    },
+    {
+      "tld": ".supply",
+      "target": "nic.supply"
+    },
+    {
+      "tld": ".support",
+      "target": "nic.support"
+    },
+    {
+      "tld": ".surgery",
+      "target": "nic.surgery"
+    },
+    {
+      "tld": ".systems",
+      "target": "nic.systems"
+    },
+    {
+      "tld": ".tab",
+      "target": "nic.tab"
+    },
+    {
+      "tld": ".taobao",
+      "target": "nic.taobao"
+    },
+    {
+      "tld": ".tatamotors",
+      "target": "nic.tatamotors"
+    },
+    {
+      "tld": ".tax",
+      "target": "nic.tax"
+    },
+    {
+      "tld": ".taxi",
+      "target": "nic.taxi"
+    },
+    {
+      "tld": ".team",
+      "target": "nic.team"
+    },
+    {
+      "tld": ".technology",
+      "target": "nic.technology"
+    },
+    {
+      "tld": ".temasek",
+      "target": "nic.temasek"
+    },
+    {
+      "tld": ".tennis",
+      "target": "nic.tennis"
+    },
+    {
+      "tld": ".thd",
+      "target": "nic.thd"
+    },
+    {
+      "tld": ".theater",
+      "target": "nic.theater"
+    },
+    {
+      "tld": ".tiaa",
+      "target": "nic.tiaa"
+    },
+    {
+      "tld": ".tienda",
+      "target": "nic.tienda"
+    },
+    {
+      "tld": ".tips",
+      "target": "nic.tips"
+    },
+    {
+      "tld": ".tires",
+      "target": "nic.tires"
+    },
+    {
+      "tld": ".tmall",
+      "target": "nic.tmall"
+    },
+    {
+      "tld": ".today",
+      "target": "nic.today"
+    },
+    {
+      "tld": ".tools",
+      "target": "nic.tools"
+    },
+    {
+      "tld": ".tours",
+      "target": "nic.tours"
+    },
+    {
+      "tld": ".town",
+      "target": "nic.town"
+    },
+    {
+      "tld": ".toys",
+      "target": "nic.toys"
+    },
+    {
+      "tld": ".trading",
+      "target": "nic.trading"
+    },
+    {
+      "tld": ".training",
+      "target": "nic.training"
+    },
+    {
+      "tld": ".travel",
+      "target": "nic.travel"
+    },
+    {
+      "tld": ".travelers",
+      "target": "nic.travelers"
+    },
+    {
+      "tld": ".travelersinsurance",
+      "target": "nic.travelersinsurance"
+    },
+    {
+      "tld": ".trv",
+      "target": "nic.trv"
+    },
+    {
+      "tld": ".tvs",
+      "target": "nic.tvs"
+    },
+    {
+      "tld": ".ubank",
+      "target": "nic.ubank"
+    },
+    {
+      "tld": ".ubs",
+      "target": "nic.ubs"
+    },
+    {
+      "tld": ".university",
+      "target": "nic.university"
+    },
+    {
+      "tld": ".ups",
+      "target": "nic.ups"
+    },
+    {
+      "tld": ".vacations",
+      "target": "nic.vacations"
+    },
+    {
+      "tld": ".vanguard",
+      "target": "nic.vanguard"
+    },
+    {
+      "tld": ".vegas",
+      "target": "nic.vegas"
+    },
+    {
+      "tld": ".ventures",
+      "target": "nic.ventures"
+    },
+    {
+      "tld": ".vet",
+      "target": "nic.vet"
+    },
+    {
+      "tld": ".viajes",
+      "target": "nic.viajes"
+    },
+    {
+      "tld": ".video",
+      "target": "nic.video"
+    },
+    {
+      "tld": ".vig",
+      "target": "nic.vig"
+    },
+    {
+      "tld": ".viking",
+      "target": "nic.viking"
+    },
+    {
+      "tld": ".villas",
+      "target": "nic.villas"
+    },
+    {
+      "tld": ".vin",
+      "target": "nic.vin"
+    },
+    {
+      "tld": ".visa",
+      "target": "nic.visa"
+    },
+    {
+      "tld": ".vision",
+      "target": "nic.vision"
+    },
+    {
+      "tld": ".vodka",
+      "target": "nic.vodka"
+    },
+    {
+      "tld": ".volvo",
+      "target": "nic.volvo"
+    },
+    {
+      "tld": ".vote",
+      "target": "nic.vote"
+    },
+    {
+      "tld": ".voto",
+      "target": "nic.voto"
+    },
+    {
+      "tld": ".voyage",
+      "target": "nic.voyage"
+    },
+    {
+      "tld": ".watch",
+      "target": "nic.watch"
+    },
+    {
+      "tld": ".watches",
+      "target": "nic.watches"
+    },
+    {
+      "tld": ".weber",
+      "target": "nic.weber"
+    },
+    {
+      "tld": ".weir",
+      "target": "nic.weir"
+    },
+    {
+      "tld": ".williamhill",
+      "target": "nic.williamhill"
+    },
+    {
+      "tld": ".wine",
+      "target": "nic.wine"
+    },
+    {
+      "tld": ".works",
+      "target": "nic.works"
+    },
+    {
+      "tld": ".world",
+      "target": "nic.world"
+    },
+    {
+      "tld": ".wtf",
+      "target": "nic.wtf"
+    },
+    {
+      "tld": ".xin",
+      "target": "nic.xin"
+    },
+    {
+      "tld": ".xn--1ck2e1b",
+      "target": "nic.xn--1ck2e1b"
+    },
+    {
+      "tld": ".xn--5su34j936bgsg",
+      "target": "nic.xn--5su34j936bgsg"
+    },
+    {
+      "tld": ".xn--5tzm5g",
+      "target": "nic.xn--5tzm5g"
+    },
+    {
+      "tld": ".xn--6frz82g",
+      "target": "nic.xn--6frz82g"
+    },
+    {
+      "tld": ".xn--b4w605ferd",
+      "target": "nic.xn--b4w605ferd"
+    },
+    {
+      "tld": ".xn--bck1b9a5dre4c",
+      "target": "nic.xn--bck1b9a5dre4c"
+    },
+    {
+      "tld": ".xn--cck2b3b",
+      "target": "nic.xn--cck2b3b"
+    },
+    {
+      "tld": ".xn--czrs0t",
+      "target": "nic.xn--czrs0t"
+    },
+    {
+      "tld": ".xn--eckvdtc9d",
+      "target": "nic.xn--eckvdtc9d"
+    },
+    {
+      "tld": ".xn--fct429k",
+      "target": "nic.xn--fct429k"
+    },
+    {
+      "tld": ".xn--fjq720a",
+      "target": "nic.xn--fjq720a"
+    },
+    {
+      "tld": ".xn--fzys8d69uvgm",
+      "target": "nic.xn--fzys8d69uvgm"
+    },
+    {
+      "tld": ".xn--gckr3f0f",
+      "target": "nic.xn--gckr3f0f"
+    },
+    {
+      "tld": ".xn--gk3at1e",
+      "target": "nic.xn--gk3at1e"
+    },
+    {
+      "tld": ".xn--jvr189m",
+      "target": "nic.xn--jvr189m"
+    },
+    {
+      "tld": ".xn--mgbi4ecexp",
+      "target": "nic.xn--mgbi4ecexp"
+    },
+    {
+      "tld": ".xn--rovu88b",
+      "target": "nic.xn--rovu88b"
+    },
+    {
+      "tld": ".xn--unup4y",
+      "target": "nic.xn--unup4y"
+    },
+    {
+      "tld": ".xn--vhquv",
+      "target": "nic.xn--vhquv"
+    },
+    {
+      "tld": ".xn--w4r85el8fhu5dnra",
+      "target": "nic.xn--w4r85el8fhu5dnra"
+    },
+    {
+      "tld": ".xn--w4rs40l",
+      "target": "nic.xn--w4rs40l"
+    },
+    {
+      "tld": ".yahoo",
+      "target": "nic.yahoo"
+    },
+    {
+      "tld": ".zara",
+      "target": "nic.zara"
+    },
+    {
+      "tld": ".zero",
+      "target": "nic.zero"
+    },
+    {
+      "tld": ".zone",
+      "target": "nic.zone"
+    }
+  ]
+}
