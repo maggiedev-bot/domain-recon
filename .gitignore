@@ -14,3 +14,8 @@ env/
 # OS / editor cruft
 .DS_Store
 *.swp
+
+# One-off internal QA/sweep drivers (not part of the skill surface); the
+# evidence they produced is committed under docs/ (revalidate-progress.jsonl).
+scripts/_revalidate_sweep.py
+scripts/_retry_known_issue.py
