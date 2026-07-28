@@ -20,17 +20,19 @@ injection surface.
 from __future__ import annotations
 
 import argparse
+import errno
 import ipaddress
 import json
 import re
 import socket
+import ssl
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
-__version__ = "0.4.1"
+__version__ = "0.6.0"
 
 USER_AGENT = "domain-recon/{v} (+https://github.com/maggiedev-bot/domain-recon)".format(v=__version__)
 
@@ -56,7 +58,163 @@ class HTTPStatusError(ReconError):
 
 
 class NetworkError(ReconError):
-    """DNS failure, connection refused, timeout, etc."""
+    """DNS failure, connection refused, timeout, etc.
+
+    Carries the originating exception on `.cause` (when known) so callers can
+    tell a narrow, retryable transport failure (connection reset / TLS RST /
+    read timeout) apart from a hard failure (DNS resolution, refused).
+    """
+
+    def __init__(self, message: str, cause: "BaseException | None" = None):
+        super().__init__(message)
+        self.cause = cause
+
+
+class RdapUnreachable(NetworkError):
+    """A bootstrap/supplement-listed authoritative RDAP endpoint was reachable
+    in principle but the connection was reset / TLS handshake RST / read timed
+    out from our egress.
+
+    This is a *distinct, retryable* condition — the RDAP server demonstrably
+    exists (it is delegated in the IANA RDAP bootstrap or the curated
+    supplement), so it must never be misfiled as 'unsupported' (no server) nor
+    as an opaque error. Subclasses NetworkError so existing
+    `except NetworkError` / `except ReconError` handlers still catch it, while
+    `fetch_rdap` intercepts it to emit a first-class `rdap_source == "unreachable"`
+    result.
+    """
+
+    def __init__(self, endpoint: str, origin: str, detail: str, cause=None):
+        self.endpoint = endpoint
+        self.origin = origin
+        self.detail = detail
+        super().__init__(
+            "RDAP endpoint {e} ({o}) unreachable: {d}".format(e=endpoint, o=origin, d=detail),
+            cause=cause,
+        )
+
+
+class RdapBroken(ReconError):
+    """A bootstrap/supplement-listed authoritative RDAP endpoint *responded*, but
+    with an unusable response — an untrusted / self-signed TLS certificate, or an
+    HTTP error status (4xx / 5xx).
+
+    This is a *fourth* first-class outcome, distinct from all three neighbours:
+      * NOT 'unsupported' (`rdap_source == "none"`): a server demonstrably EXISTS
+        (the TLD is delegated in the IANA bootstrap or the curated supplement) —
+        it is just serving garbage / erroring, not absent.
+      * NOT 'unreachable' (`rdap_source == "unreachable"`): there we got no HTTP
+        response at all (connection reset / TLS-RST / read timeout at the
+        transport layer). Here the endpoint answered — we just can't use it.
+      * NOT an opaque crash: it is classified and labelled honestly.
+
+    Retryability differs by cause and is carried on `.retryable`: a bad TLS cert
+    or a 4xx is a persistent registry-side fault (retry won't help →
+    `retryable=False`); a 5xx is a server-side error class that per HTTP
+    semantics warrants a later retry (`retryable=True`). `fetch_rdap` intercepts
+    it to emit a first-class `rdap_source == "broken"` result; the exit code is
+    driven by `.retryable` (retryable → 3, non-retryable → 4) so a shell caller
+    can branch "retry later" from "don't bother".
+    """
+
+    def __init__(self, endpoint: str, origin: str, cause: str, retryable: bool,
+                 http_status: "int | None" = None, detail: str = ""):
+        self.endpoint = endpoint
+        self.origin = origin
+        self.cause = cause            # short slug: 'bad-cert' | 'http-<status>'
+        self.retryable = retryable
+        self.http_status = http_status
+        self.detail = detail
+        super().__init__(
+            "RDAP endpoint {e} ({o}) broken ({c}): {d}".format(
+                e=endpoint, o=origin, c=cause, d=detail or cause
+            )
+        )
+
+
+def _is_unreachable_signal(err: "BaseException") -> bool:
+    """True iff `err` is the narrow, retryable 'endpoint reset the connection /
+    TLS handshake RST / read timed out' condition.
+
+    Deliberately narrow so it never swallows a genuine ban or a real absence:
+      * excludes RateLimitError (429/ban) and HTTPStatusError (any HTTP status),
+      * excludes DNS-resolution failure (socket.gaierror) and connection-refused
+        (ECONNREFUSED),
+      * matches only connection-reset (ECONNRESET / errno 104), read timeouts
+        (socket.timeout / TimeoutError), and TLS handshake resets / unexpected
+        EOF (ssl.SSLError signalling a reset).
+    """
+    if isinstance(err, (RateLimitError, HTTPStatusError)):
+        return False
+    # Unwrap: NetworkError carries the raw cause; urllib.error.URLError nests
+    # the transport error under `.reason`.
+    inner = getattr(err, "cause", None) or err
+    inner = getattr(inner, "reason", inner)
+    if isinstance(inner, (socket.timeout, TimeoutError)):
+        return True
+    if isinstance(inner, ConnectionResetError):
+        return True
+    # gaierror (DNS) and ConnectionRefusedError are OSErrors too — gate on errno.
+    if isinstance(inner, ssl.SSLError):
+        s = str(inner).lower()
+        if any(k in s for k in ("reset", "unexpected eof", "eof occurred", "handshake")):
+            return True
+        return False
+    if isinstance(inner, OSError) and getattr(inner, "errno", None) == errno.ECONNRESET:
+        return True
+    # Last-resort string sniff for transports that surface the reset/timeout
+    # opaquely (e.g. wrapped in a bare URLError string).
+    s = str(err).lower()
+    return any(
+        k in s
+        for k in ("reset by peer", "econnreset", "errno 104", "read timed out", "timed out reading")
+    )
+
+
+def _endpoint_fault(err: "BaseException") -> "tuple[str, bool, int | None] | None":
+    """Classify a *definitive endpoint fault* on a delegated RDAP server — the
+    endpoint responded, but with something we cannot use.
+
+    Returns `(cause_slug, retryable, http_status)` or `None` when `err` is not a
+    definitive endpoint fault (so the caller keeps its existing behaviour —
+    e.g. fall through to the rdap.org redirector).
+
+    Deliberately narrow and mutually-exclusive with `_is_unreachable_signal`
+    (which the caller checks *first*, so any transport reset / TLS-RST / read
+    timeout is already claimed by 'unreachable' before we get here):
+      * bad TLS certificate  → ('bad-cert', False, None) — untrusted / self-signed
+        chain; a persistent registry-side fault, retry cannot help.
+      * HTTP 4xx (≠429)      → ('http-<st>', False, st) — the endpoint answered
+        definitively (426 upgrade-required, 404 apex, …); not retryable.
+      * HTTP 5xx             → ('http-<st>', True,  st) — server-side error class;
+        per HTTP semantics a later retry may succeed → retryable.
+
+    A 429/ban (`RateLimitError`), a DNS-resolution failure, a connection-refused,
+    and a genuine 'no server' absence can NEVER be misfiled here — the first two
+    are excluded explicitly, the last never reaches this path (it is decided by
+    bootstrap membership upstream, not by an exception).
+    """
+    # A 429/ban is never a 'broken endpoint' — it is a rate-limit to honour.
+    if isinstance(err, RateLimitError):
+        return None
+    if isinstance(err, HTTPStatusError):
+        st = err.status
+        if st == 429:                       # defensive: real 429s are RateLimitError
+            return None
+        if 500 <= st < 600:
+            return ("http-{}".format(st), True, st)      # server error: retryable
+        if 400 <= st < 500:
+            return ("http-{}".format(st), False, st)     # client/definitive: not retryable
+        return None
+    # Transport layer: only an untrusted/self-signed *certificate verification*
+    # failure is a 'broken' endpoint. A reset / TLS-RST / timeout is 'unreachable'
+    # and was already claimed by _is_unreachable_signal upstream. SSLCertVerificationError
+    # is a distinct subclass of ssl.SSLError, so this never catches a plain reset.
+    inner = getattr(err, "cause", None) or err
+    inner = getattr(inner, "reason", inner)
+    if isinstance(inner, ssl.SSLCertVerificationError):
+        return ("bad-cert", False, None)
+    return None
 
 
 class ParseError(ReconError):
@@ -137,7 +295,7 @@ def http_get(
         except (urllib.error.URLError, socket.timeout, TimeoutError) as e:
             # DNS failure, connection refused, timeout.
             if attempt > retries:
-                raise NetworkError("network error for {u}: {e}".format(u=url, e=e))
+                raise NetworkError("network error for {u}: {e}".format(u=url, e=e), cause=e)
             _sleep(min(max_backoff, backoff * (2 ** (attempt - 1))))
             continue
 
@@ -688,18 +846,49 @@ def _fetch_rdap_domain(domain: str, timeout: float, retries: int, use_bootstrap:
     bootstrap unreachable, we cannot make that determination, so we still fall
     back to rdap.org.)
     """
+    auth_base = None
+    auth_origin = None
+    auth_fault = None  # a definitive endpoint fault seen on the authoritative server
     if use_bootstrap:
         base, origin, bootstrap_ok = _rdap_base_for_domain(domain, timeout, retries)
         if base:
+            auth_base, auth_origin = base, origin
             try:
                 return http_get_json(base, headers={"Accept": _RDAP_ACCEPT}, timeout=timeout, retries=retries), origin
-            except ReconError:
-                pass  # authoritative server failed -> try the redirector
+            except ReconError as e:
+                # The authoritative endpoint is delegated (bootstrap/supplement).
+                #   (1) transport reset / TLS-RST / read timeout -> 'unreachable'
+                #       (retryable — we got no HTTP response). rdap.org only
+                #       *redirects* the client back to this same backend, so a
+                #       reset would just recur; short-circuit as unreachable.
+                if _is_unreachable_signal(e):
+                    raise RdapUnreachable(endpoint=base, origin=origin or "iana-bootstrap", detail=str(e), cause=e) from e
+                #   (2) endpoint *responded* unusably (bad TLS cert / HTTP 4xx /
+                #       5xx). Remember it, but still try the rdap.org redirector —
+                #       it may resolve to a different server that answers (e.g.
+                #       .io). Only if the redirector ALSO fails do we surface the
+                #       authoritative fault as the first-class 'broken' state, so
+                #       'broken' means "both the authoritative server and the
+                #       redirector were exhausted", not one transient 404.
+                auth_fault = _endpoint_fault(e)
+                pass  # fall through to the redirector
         elif bootstrap_ok:
             # TLD authoritatively absent from bootstrap + supplement: no coverage.
             return None, "none"
     url = "https://rdap.org/domain/{}".format(urllib.parse.quote(domain, safe=""))
-    return http_get_json(url, headers={"Accept": _RDAP_ACCEPT}, timeout=timeout, retries=retries), "rdap.org"
+    try:
+        return http_get_json(url, headers={"Accept": _RDAP_ACCEPT}, timeout=timeout, retries=retries), "rdap.org"
+    except ReconError as e2:
+        # The redirector failed too. If the authoritative server had a definitive
+        # endpoint fault, surface THAT (the real registry cause) as 'broken'
+        # rather than the opaque redirector error; otherwise propagate as before.
+        if auth_fault is not None:
+            cause, retryable, status = auth_fault
+            raise RdapBroken(
+                endpoint=auth_base, origin=auth_origin or "iana-bootstrap",
+                cause=cause, retryable=retryable, http_status=status, detail=str(e2),
+            ) from e2
+        raise
 
 
 def _rdap_unsupported(resource: str, kind: str, domain: str) -> dict:
@@ -725,12 +914,107 @@ def _rdap_unsupported(resource: str, kind: str, domain: str) -> dict:
     }
 
 
+def _rdap_unreachable(resource: str, kind: str, domain: str, err: "RdapUnreachable") -> dict:
+    """Build a first-class 'RDAP endpoint unreachable (retryable)' result.
+
+    Distinct from `_rdap_unsupported`: here a public RDAP server *does* exist
+    (the TLD is delegated in the IANA bootstrap or the curated supplement) — we
+    simply could not reach it from our egress this time (connection reset / TLS
+    handshake RST / read timeout). The signal to a consuming agent: the data
+    exists, we could not fetch it, skip the field but know it is **retryable** —
+    NOT "this TLD has no RDAP server".
+    """
+    tld = domain.rsplit(".", 1)[-1]
+    origin = getattr(err, "origin", None) or "iana-bootstrap"
+    return {
+        "source": "rdap",
+        "kind": kind,
+        "target": resource,
+        "supported": True,
+        "rdap_source": "unreachable",
+        "tld": tld,
+        "endpoint": getattr(err, "endpoint", None),
+        "origin": origin,
+        "retryable": True,
+        "reason": (
+            "registry RDAP endpoint for .{tld} was unreachable from our egress — "
+            "the connection was reset / TLS handshake RST / read timed out "
+            "(errno 104 / connection reset class). The endpoint is delegated via "
+            "the IANA RDAP {origin}, so this is reachable-but-unreachable and "
+            "retryable, NOT 'unsupported'. detail: {detail}".format(
+                tld=tld, origin=origin, detail=getattr(err, "detail", None) or str(err)
+            )
+        ),
+    }
+
+
+def _rdap_broken(resource: str, kind: str, domain: str, err: "RdapBroken") -> dict:
+    """Build a first-class 'RDAP endpoint broken' result.
+
+    Distinct from `_rdap_unsupported` (no server exists) and `_rdap_unreachable`
+    (transport reset/timeout — no HTTP response): here a public RDAP server
+    *does* exist and *did* respond, but with an untrusted/self-signed TLS cert
+    or an HTTP error status. The signal to a consuming agent: the endpoint is
+    faulty — skip the field; `retryable` says whether trying later can help (a
+    5xx may recover; a bad cert / 4xx will not until the registry fixes it).
+    """
+    tld = domain.rsplit(".", 1)[-1]
+    origin = getattr(err, "origin", None) or "iana-bootstrap"
+    cause = getattr(err, "cause", None) or "endpoint-error"
+    retryable = bool(getattr(err, "retryable", False))
+    status = getattr(err, "http_status", None)
+    if cause == "bad-cert":
+        what = ("presented an untrusted / self-signed TLS certificate that fails "
+                "verification (we do NOT disable TLS verification)")
+    elif status is not None and 500 <= status < 600:
+        what = "returned HTTP {} (server-side error)".format(status)
+    elif status == 426:
+        what = ("returned HTTP 426 Upgrade Required — it demands a protocol upgrade "
+                "a standard RDAP client will not satisfy")
+    elif status == 404:
+        what = ("returned HTTP 404 for this apex — the delegated server does not "
+                "serve an RDAP object here (registry edge), though the domain "
+                "resolves in DNS")
+    elif status is not None:
+        what = "returned HTTP {}".format(status)
+    else:
+        what = "returned an unusable response"
+    return {
+        "source": "rdap",
+        "kind": kind,
+        "target": resource,
+        "supported": True,
+        "rdap_source": "broken",
+        "tld": tld,
+        "endpoint": getattr(err, "endpoint", None),
+        "origin": origin,
+        "cause": cause,
+        "http_status": status,
+        "retryable": retryable,
+        "reason": (
+            "registry RDAP endpoint for .{tld} is broken — it {what}. The endpoint "
+            "is delegated via the IANA RDAP {origin} (a server exists and answered), "
+            "so this is a genuine registry-side fault, NOT 'unsupported' (no server) "
+            "and NOT 'unreachable' (transport reset). {retry}.".format(
+                tld=tld, what=what, origin=origin,
+                retry=("Retryable — a later attempt may succeed" if retryable
+                       else "Not retryable — retrying will not help until the registry fixes it"),
+            )
+        ),
+    }
+
+
 def fetch_rdap(resource: str, kind: "str | None" = None, timeout=20.0, retries=3, use_bootstrap=True) -> dict:
     kind = kind or classify_resource(resource)
     rdap_source = None
     if kind == "domain":
         d = normalize_domain(resource)
-        obj, rdap_source = _fetch_rdap_domain(d, timeout, retries, use_bootstrap=use_bootstrap)
+        try:
+            obj, rdap_source = _fetch_rdap_domain(d, timeout, retries, use_bootstrap=use_bootstrap)
+        except RdapUnreachable as e:
+            return _rdap_unreachable(resource, kind, d, e)
+        except RdapBroken as e:
+            return _rdap_broken(resource, kind, d, e)
         if rdap_source == "none":
             return _rdap_unsupported(resource, kind, d)
     elif kind == "ip":
@@ -1263,6 +1547,16 @@ def render_human(result: dict) -> str:
         for err in result.get("errors") or []:
             lines.append("  ! {} unavailable: {}".format(err["source"], err["error"]))
     elif src == "rdap":
+        if result.get("rdap_source") == "unreachable":
+            lines.append("RDAP ({}) — .{} endpoint unreachable (retryable)".format(result.get("kind"), result.get("tld")))
+            lines.append("  {}".format(result.get("reason")))
+            return "\n".join(lines)
+        if result.get("rdap_source") == "broken":
+            rtag = "retryable" if result.get("retryable") else "not retryable"
+            lines.append("RDAP ({}) — .{} endpoint broken [{}] ({})".format(
+                result.get("kind"), result.get("tld"), result.get("cause"), rtag))
+            lines.append("  {}".format(result.get("reason")))
+            return "\n".join(lines)
         if result.get("supported") is False:
             lines.append("RDAP ({}) — unsupported for .{}".format(result.get("kind"), result.get("tld")))
             lines.append("  {}".format(result.get("reason")))
@@ -1346,7 +1640,12 @@ def _render_profile(result: dict) -> str:
     lines = ["profile — {}".format(apex)]
 
     rdap = (result.get("apex") or {}).get("rdap")
-    if rdap and rdap.get("supported") is False:
+    if rdap and rdap.get("rdap_source") == "unreachable":
+        lines.append("  rdap: unreachable (.{} endpoint reset/timed out — retryable)".format(rdap.get("tld")))
+    elif rdap and rdap.get("rdap_source") == "broken":
+        rtag = "retryable" if rdap.get("retryable") else "not retryable"
+        lines.append("  rdap: broken (.{} endpoint {} — {})".format(rdap.get("tld"), rdap.get("cause"), rtag))
+    elif rdap and rdap.get("supported") is False:
         lines.append("  rdap: unsupported (.{} has no public RDAP server)".format(rdap.get("tld")))
     elif rdap:
         reg = (rdap.get("events") or {}).get("registration")
@@ -1510,6 +1809,27 @@ def run(argv=None) -> int:
         print("error: {}".format(e), file=sys.stderr)
         return 2
     _emit(res, args)
+    # Quint-state RDAP contract, kept honest via the exit code. The code encodes
+    # the *actionable retryability tier*; the JSON `rdap_source` names the
+    # mechanism (unreachable = transport, broken = endpoint answered with a fault):
+    #   0 = clean data (a real answer, OR a definitive 'unsupported'/WHOIS-only
+    #       TLD — a terminal, non-retryable capability gap)
+    #   2 = genuine error / crash (unhandled ReconError above — incl. 429/ban)
+    #   3 = RETRYABLE failure: the endpoint is delegated (a server exists) but we
+    #       could not get usable data this time and a later attempt may succeed —
+    #       'unreachable' (transport reset/TLS-RST/timeout) OR 'broken' 5xx.
+    #   4 = NON-retryable endpoint fault: 'broken' with an untrusted/self-signed
+    #       TLS cert or an HTTP 4xx — the server answered definitively; retrying
+    #       will not help until the registry fixes it.
+    # Neither 3 nor 4 is collapsed into success: the field was not fetched, so a
+    # caller branching on exit status can tell "skip, retry later" (3) from
+    # "skip, don't bother" (4) from "clean result" (0).
+    if isinstance(res, dict) and res.get("source") == "rdap":
+        rs = res.get("rdap_source")
+        if rs == "unreachable":
+            return 3
+        if rs == "broken":
+            return 3 if res.get("retryable") else 4
     return 0
 
 

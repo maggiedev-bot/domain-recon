@@ -1,7 +1,7 @@
 ---
 name: domain-recon
 description: Passive domain/infra OSINT over five keyless public APIs — subdomains, RDAP/WHOIS, DNS-over-HTTPS, IP geo/ISP, and ASN/prefix ownership.
-metadata: {"openclaw": {"requires": {"bins": ["python3"]}, "emoji": "🛰️"}, "homepage": "https://github.com/maggiedev-bot/domain-recon", "version": "0.4.1"}
+metadata: {"openclaw": {"requires": {"bins": ["python3"]}, "emoji": "🛰️"}, "homepage": "https://github.com/maggiedev-bot/domain-recon", "version": "0.6.0"}
 ---
 
 # domain-recon
@@ -116,6 +116,39 @@ returns one merged JSON/`--human` report.
   `docs/tld-rdap-coverage.md` for the full per-TLD map (which of the 1,438
   delegated TLDs are `bootstrap` / `supplement` / `none`), regenerable with
   `python3 {baseDir}/scripts/gen_coverage.py`.
+- **Third state — `rdap` distinguishes "unreachable" from "unsupported".** A TLD
+  can be *delegated in the IANA bootstrap yet unreachable from our egress*: the
+  registry's authoritative RDAP server resets the connection / RSTs the TLS
+  handshake / read-times-out (errno 104 class). This is neither a clean answer
+  nor a real capability gap, so `rdap` emits a distinct
+  **`{"supported": true, "rdap_source": "unreachable", "retryable": true, "reason": ...}`**
+  result. The signal to a caller: *the data exists, we could not fetch it — skip
+  the field but know it is retryable*, NOT "this TLD has no RDAP server". The
+  trigger is deliberately narrow (connection reset / TLS RST / read timeout
+  against a bootstrap- or supplement-listed endpoint); a `429`/ban or a genuine
+  absence never lands here. Because the fetch did not succeed, this outcome
+  carries its **own exit code `3`** (see Exit codes) rather than collapsing into
+  `0`. Inside `profile` it appears as a clean `unreachable` signal under
+  `apex.rdap`, never in `errors[]`.
+- **Fourth state — `rdap` distinguishes "broken" from "unreachable".** A
+  delegated endpoint can *respond, but with an unusable response*: an
+  untrusted/self-signed TLS certificate that fails verification, or an HTTP
+  error status (4xx / 5xx). This is neither a clean answer, a real capability
+  gap, nor a transport reset, so `rdap` emits a distinct
+  **`{"supported": true, "rdap_source": "broken", "cause": "<slug>", "http_status": <int|null>, "retryable": <bool>, "reason": ...}`**
+  result. `cause` is `bad-cert` or `http-<status>` (e.g. `http-426`, `http-404`,
+  `http-500`); `retryable` is `false` for a bad cert / 4xx (a persistent
+  registry-side fault) and `true` for a 5xx (a server error a later attempt may
+  clear). The signal to a caller: *the endpoint is faulty — skip the field;
+  `retryable` says whether trying later helps.* recon does **not** disable TLS
+  verification or fake a fetch — it only *labels* the fault honestly. The
+  trigger is narrow and mutually-exclusive with `unreachable`: a `429`/ban, a
+  DNS-resolution failure, a connection-refused, and a genuine absence never land
+  here, and `broken` is only emitted after **both** the authoritative server and
+  the rdap.org redirector are exhausted (so it never fires where the redirector
+  could still rescue the lookup). Exit code is driven by `retryable` (see Exit
+  codes). Inside `profile` it appears as a clean `broken` signal under
+  `apex.rdap`, never in `errors[]`.
 - **`profile` runtime is bounded, not instant.** A full profile fans out across
   ~6 sources and multiple hosts with courtesy rate-limit spacing, so a large
   domain (dozens of subdomains) takes roughly **1–1.5 min** — it is working, not
@@ -124,8 +157,24 @@ returns one merged JSON/`--human` report.
   retry) so it can never dominate; a timed-out archive lookup is fault-isolated
   into `errors[]` like any other. Use `--no-wayback` or a lower `--ip-limit` to
   make a profile faster.
-- **Exit codes:** `0` success, `2` on a handled error (bad input, upstream
-  failure) with a message on stderr.
+- **Exit codes (quint-state).** The code encodes the *actionable retryability
+  tier*; the JSON `rdap_source` names the mechanism. A caller branching on exit
+  status can tell "clean result" from "skip, retry later" from "skip, don't
+  bother":
+  - `0` — success: a real answer **or** a definitive `unsupported`/WHOIS-only TLD
+    (a terminal, non-retryable capability gap, `rdap_source:"none"`).
+  - `2` — a handled error (bad input, upstream failure, **429/ban**) with a
+    message on stderr.
+  - `3` — **retryable** RDAP failure: the endpoint is delegated (a server exists)
+    but we could not get usable data this time and a later attempt may succeed —
+    either `rdap_source:"unreachable"` (transport reset / TLS-RST / read timeout)
+    or `rdap_source:"broken"` with a 5xx (`retryable:true`).
+  - `4` — **non-retryable** endpoint fault: `rdap_source:"broken"` with an
+    untrusted/self-signed TLS cert or an HTTP 4xx (`retryable:false`) — the
+    server answered definitively; retrying will not help until the registry fixes
+    it.
+  Neither `3` nor `4` is folded into `0`: the field was not fetched, so the
+  distinction (retry later vs. don't bother vs. clean) is preserved.
 
 ## For maintainers — running the tests
 

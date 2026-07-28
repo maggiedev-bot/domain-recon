@@ -8,6 +8,7 @@ fixtures in tests/fixtures/, with the HTTP layer either patched at the
 import email.message
 import io
 import socket
+import ssl
 import urllib.error
 
 import pytest
@@ -1253,3 +1254,434 @@ class TestRdapUnsupported:
         out = recon.render_human(rep)
         assert "rdap: unsupported" in out
         assert "registration: None" not in out
+
+
+# ---------------------------------------------------------------------------
+# RDAP third state: 'unreachable' — the endpoint is delegated (bootstrap-present)
+# but reset/timed-out from our egress. Distinct from both PASS and 'unsupported'.
+# ---------------------------------------------------------------------------
+
+
+def _reset_neterr(msg="network error: reset"):
+    return recon.NetworkError(msg, cause=ConnectionResetError(104, "Connection reset by peer"))
+
+
+class TestUnreachableSignalClassifier:
+    def test_connection_reset_is_unreachable(self):
+        assert recon._is_unreachable_signal(_reset_neterr()) is True
+
+    def test_errno_104_oserror_is_unreachable(self):
+        e = recon.NetworkError("x", cause=OSError(104, "Connection reset by peer"))
+        assert recon._is_unreachable_signal(e) is True
+
+    def test_read_timeout_is_unreachable(self):
+        assert recon._is_unreachable_signal(recon.NetworkError("t", cause=socket.timeout("timed out"))) is True
+
+    def test_tls_handshake_reset_is_unreachable(self):
+        import ssl as _ssl
+        e = recon.NetworkError("tls", cause=_ssl.SSLError("[SSL] record layer failure: connection reset"))
+        assert recon._is_unreachable_signal(e) is True
+
+    def test_urlerror_wrapping_reset_is_unreachable(self):
+        wrapped = urllib.error.URLError(ConnectionResetError(104, "reset"))
+        assert recon._is_unreachable_signal(recon.NetworkError("w", cause=wrapped)) is True
+
+    def test_rate_limit_is_NOT_unreachable(self):
+        # A 429/ban must never be misfiled as the retryable-transport state.
+        assert recon._is_unreachable_signal(recon.RateLimitError("rate limited")) is False
+
+    def test_http_status_is_NOT_unreachable(self):
+        assert recon._is_unreachable_signal(recon.HTTPStatusError(500, "http://x")) is False
+
+    def test_dns_resolution_failure_is_NOT_unreachable(self):
+        # gaierror is an OSError but not ECONNRESET — must not be swallowed here.
+        e = recon.NetworkError("dns", cause=socket.gaierror(-2, "Name or service not known"))
+        assert recon._is_unreachable_signal(e) is False
+
+    def test_connection_refused_is_NOT_unreachable(self):
+        e = recon.NetworkError("refused", cause=ConnectionRefusedError(111, "Connection refused"))
+        assert recon._is_unreachable_signal(e) is False
+
+
+class TestRdapUnreachable:
+    @pytest.fixture(autouse=True)
+    def _clear_cache(self):
+        recon._RDAP_BOOTSTRAP_CACHE.clear()
+        yield
+        recon._RDAP_BOOTSTRAP_CACHE.clear()
+
+    def test_authoritative_reset_yields_unreachable_not_error(self, monkeypatch):
+        # .ai is delegated in the bootstrap -> identitydigital. If that
+        # authoritative server resets the connection, we must classify it as
+        # 'unreachable' (retryable), NOT crash and NOT claim 'unsupported'.
+        urls = []
+
+        def fake(url, headers=None, timeout=15.0, retries=3):
+            urls.append(url)
+            if "data.iana.org" in url:
+                return load_fixture("rdap_bootstrap_dns.json")
+            if "identitydigital" in url:
+                raise _reset_neterr()
+            raise AssertionError("unexpected url: " + url)
+
+        monkeypatch.setattr(recon, "http_get_json", fake)
+        res = recon.fetch_rdap("example.ai")
+        assert res["source"] == "rdap"
+        assert res["supported"] is True          # a server exists...
+        assert res["rdap_source"] == "unreachable"  # ...we just couldn't reach it
+        assert res["retryable"] is True
+        assert res["tld"] == "ai"
+        assert res["origin"] == "iana-bootstrap"
+        assert "retryable" in res["reason"].lower()
+        assert "errno 104" in res["reason"].lower() or "reset" in res["reason"].lower()
+        # Must NOT fall through to the redirector (same broken backend from our egress).
+        assert not any("rdap.org" in u for u in urls)
+
+    def test_authoritative_reset_is_distinct_from_unsupported(self, monkeypatch):
+        # Guard the whole point: reachable-but-unreachable must never reuse the
+        # 'supported: false / rdap_source: none' shape (which asserts no server).
+        def fake(url, headers=None, timeout=15.0, retries=3):
+            if "data.iana.org" in url:
+                return load_fixture("rdap_bootstrap_dns.json")
+            if "identitydigital" in url:
+                raise _reset_neterr()
+            raise AssertionError("unexpected url: " + url)
+
+        monkeypatch.setattr(recon, "http_get_json", fake)
+        res = recon.fetch_rdap("example.ai")
+        assert not (res["supported"] is False)
+        assert res["rdap_source"] != "none"
+
+    def test_authoritative_refused_still_falls_back_to_rdap_org(self, monkeypatch):
+        # A NON-reset transport failure (connection refused / DNS / 5xx) is NOT
+        # the 'unreachable' state — it should still try the redirector so we
+        # don't over-claim. Keeps the trigger narrow.
+        urls = []
+
+        def fake(url, headers=None, timeout=15.0, retries=3):
+            urls.append(url)
+            if "data.iana.org" in url:
+                return load_fixture("rdap_bootstrap_dns.json")
+            if "identitydigital" in url:
+                raise recon.NetworkError("refused", cause=ConnectionRefusedError(111, "refused"))
+            if "rdap.org" in url:
+                return load_fixture("rdap_domain_example.json")
+            raise AssertionError("unexpected url: " + url)
+
+        monkeypatch.setattr(recon, "http_get_json", fake)
+        res = recon.fetch_rdap("example.ai")
+        assert res["rdap_source"] == "rdap.org"
+        assert res["supported"] is True
+        assert any("rdap.org/domain" in u for u in urls)
+
+    def test_supplement_endpoint_reset_is_unreachable(self, monkeypatch):
+        # .io resolves via the curated supplement; a reset there is unreachable
+        # too, with origin reported as 'supplement'.
+        def fake(url, headers=None, timeout=15.0, retries=3):
+            if "data.iana.org" in url:
+                return load_fixture("rdap_bootstrap_dns.json")  # io absent -> supplement
+            if "identitydigital" in url:
+                raise _reset_neterr()
+            raise AssertionError("unexpected url: " + url)
+
+        monkeypatch.setattr(recon, "http_get_json", fake)
+        res = recon.fetch_rdap("example.io")
+        assert res["rdap_source"] == "unreachable"
+        assert res["origin"] == "supplement"
+
+    def test_builder_shape(self):
+        err = recon.RdapUnreachable(endpoint="https://rdap.nic.beer/domain/x.beer",
+                                    origin="iana-bootstrap", detail="reset")
+        res = recon._rdap_unreachable("x.beer", "domain", "x.beer", err)
+        assert res["source"] == "rdap"
+        assert res["supported"] is True
+        assert res["rdap_source"] == "unreachable"
+        assert res["retryable"] is True
+        assert res["tld"] == "beer"
+        assert res["endpoint"] == "https://rdap.nic.beer/domain/x.beer"
+
+    def test_cli_exit_code_is_3(self, monkeypatch, capsys):
+        # The whole tri/quad-state is kept honest by the exit code: 'unreachable'
+        # gets its own code 3, not folded into success (0) or error (2).
+        monkeypatch.setattr(
+            recon, "fetch_rdap",
+            lambda *a, **k: recon._rdap_unreachable(
+                "example.beer", "domain", "example.beer",
+                recon.RdapUnreachable("https://rdap.nic.beer", "iana-bootstrap", "reset"),
+            ),
+        )
+        rc = recon.run(["rdap", "example.beer"])
+        out = capsys.readouterr().out
+        assert rc == 3
+        assert '"unreachable"' in out
+
+    def test_human_render_unreachable(self):
+        err = recon.RdapUnreachable("https://rdap.nic.beer", "iana-bootstrap", "reset")
+        res = recon._rdap_unreachable("example.beer", "domain", "example.beer", err)
+        out = recon.render_human(res)
+        assert "endpoint unreachable (retryable)" in out
+        assert "— None" not in out
+
+    def test_profile_unreachable_rdap_is_not_an_error(self, monkeypatch):
+        resolve_map = {}
+        _install_profile_fakes(monkeypatch, resolve_map)
+        err = recon.RdapUnreachable("https://rdap.nic.beer", "iana-bootstrap", "reset")
+        monkeypatch.setattr(
+            recon, "fetch_rdap",
+            lambda *a, **k: recon._rdap_unreachable("example.beer", "domain", "example.beer", err),
+        )
+        rep = recon.run_profile("example.beer")
+        assert rep["apex"]["rdap"]["rdap_source"] == "unreachable"
+        assert not any(e["step"] == "rdap" for e in rep["errors"])
+        out = recon.render_human(rep)
+        assert "rdap: unreachable" in out
+
+
+# ---------------------------------------------------------------------------
+# RDAP fourth state: 'broken' — the endpoint is delegated (bootstrap-present)
+# and *responded*, but with an unusable response (untrusted/self-signed TLS
+# cert, or an HTTP 4xx/5xx). Distinct from PASS, 'unsupported' (no server), and
+# 'unreachable' (transport reset/timeout — no response at all).
+# ---------------------------------------------------------------------------
+
+
+def _cert_neterr(msg="unable to get local issuer certificate"):
+    inner = ssl.SSLCertVerificationError(
+        1, "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: " + msg
+    )
+    return recon.NetworkError("net", cause=urllib.error.URLError(inner))
+
+
+class TestEndpointFaultClassifier:
+    def test_bad_cert_is_broken_not_retryable(self):
+        assert recon._endpoint_fault(_cert_neterr()) == ("bad-cert", False, None)
+
+    def test_self_signed_cert_is_broken(self):
+        assert recon._endpoint_fault(_cert_neterr("self-signed certificate")) == ("bad-cert", False, None)
+
+    def test_http_426_is_broken_not_retryable(self):
+        assert recon._endpoint_fault(recon.HTTPStatusError(426, "u")) == ("http-426", False, 426)
+
+    def test_http_404_apex_is_broken_not_retryable(self):
+        assert recon._endpoint_fault(recon.HTTPStatusError(404, "u")) == ("http-404", False, 404)
+
+    def test_http_500_is_broken_but_retryable(self):
+        assert recon._endpoint_fault(recon.HTTPStatusError(500, "u")) == ("http-500", True, 500)
+
+    def test_http_503_is_broken_but_retryable(self):
+        assert recon._endpoint_fault(recon.HTTPStatusError(503, "u")) == ("http-503", True, 503)
+
+    # --- boundary: these must NEVER be misfiled as 'broken' ---
+    def test_connection_reset_is_NOT_broken(self):
+        # A transport reset belongs to 'unreachable', which is checked first.
+        assert recon._endpoint_fault(_reset_neterr()) is None
+        assert recon._is_unreachable_signal(_reset_neterr()) is True
+
+    def test_tls_handshake_reset_is_NOT_broken(self):
+        # A TLS-RST is a reset (unreachable), not a cert-verification failure.
+        e = recon.NetworkError("tls", cause=ssl.SSLError("[SSL] record layer failure: connection reset"))
+        assert recon._endpoint_fault(e) is None
+        assert recon._is_unreachable_signal(e) is True
+
+    def test_read_timeout_is_NOT_broken(self):
+        assert recon._endpoint_fault(recon.NetworkError("t", cause=socket.timeout("timed out"))) is None
+
+    def test_rate_limit_is_NOT_broken(self):
+        # A 429/ban is a rate-limit to honour, never a 'broken endpoint'.
+        assert recon._endpoint_fault(recon.RateLimitError("rate limited")) is None
+
+    def test_http_429_status_is_NOT_broken(self):
+        assert recon._endpoint_fault(recon.HTTPStatusError(429, "u")) is None
+
+    def test_dns_resolution_failure_is_NOT_broken(self):
+        e = recon.NetworkError("dns", cause=socket.gaierror(-2, "Name or service not known"))
+        assert recon._endpoint_fault(e) is None
+
+    def test_connection_refused_is_NOT_broken(self):
+        e = recon.NetworkError("refused", cause=ConnectionRefusedError(111, "Connection refused"))
+        assert recon._endpoint_fault(e) is None
+
+    def test_parse_error_is_NOT_broken(self):
+        assert recon._endpoint_fault(recon.ParseError("bad json")) is None
+
+
+class TestRdapBroken:
+    @pytest.fixture(autouse=True)
+    def _clear_cache(self):
+        recon._RDAP_BOOTSTRAP_CACHE.clear()
+        yield
+        recon._RDAP_BOOTSTRAP_CACHE.clear()
+
+    def test_authoritative_bad_cert_yields_broken_not_error(self, monkeypatch):
+        # .ai is delegated in the bootstrap. If BOTH its authoritative server and
+        # the rdap.org redirector present an untrusted cert (rdap.org redirects
+        # the client back to the same backend), classify 'broken' (non-retryable),
+        # not a crash and not 'unsupported'. The authoritative cause (bad-cert) is
+        # preserved even though the redirector was also tried.
+        urls = []
+
+        def fake(url, headers=None, timeout=15.0, retries=3):
+            urls.append(url)
+            if "data.iana.org" in url:
+                return load_fixture("rdap_bootstrap_dns.json")
+            if "identitydigital" in url or "rdap.org" in url:
+                raise _cert_neterr()
+            raise AssertionError("unexpected url: " + url)
+
+        monkeypatch.setattr(recon, "http_get_json", fake)
+        res = recon.fetch_rdap("example.ai")
+        assert res["source"] == "rdap"
+        assert res["supported"] is True          # a server exists...
+        assert res["rdap_source"] == "broken"    # ...it just serves a bad cert
+        assert res["cause"] == "bad-cert"
+        assert res["retryable"] is False
+        assert res["tld"] == "ai"
+        assert res["origin"] == "iana-bootstrap"
+        assert "not retryable" in res["reason"].lower()
+        # It DID try the redirector (rescue chance) before concluding broken.
+        assert any("rdap.org" in u for u in urls)
+
+    def test_authoritative_http_426_yields_broken_not_retryable(self, monkeypatch):
+        def fake(url, headers=None, timeout=15.0, retries=3):
+            if "data.iana.org" in url:
+                return load_fixture("rdap_bootstrap_dns.json")
+            if "identitydigital" in url or "rdap.org" in url:
+                raise recon.HTTPStatusError(426, url)
+            raise AssertionError("unexpected url: " + url)
+
+        monkeypatch.setattr(recon, "http_get_json", fake)
+        res = recon.fetch_rdap("example.ai")
+        assert res["rdap_source"] == "broken"
+        assert res["cause"] == "http-426"
+        assert res["http_status"] == 426
+        assert res["retryable"] is False
+
+    def test_authoritative_http_500_yields_broken_but_retryable(self, monkeypatch):
+        def fake(url, headers=None, timeout=15.0, retries=3):
+            if "data.iana.org" in url:
+                return load_fixture("rdap_bootstrap_dns.json")
+            if "identitydigital" in url or "rdap.org" in url:
+                raise recon.HTTPStatusError(500, url)
+            raise AssertionError("unexpected url: " + url)
+
+        monkeypatch.setattr(recon, "http_get_json", fake)
+        res = recon.fetch_rdap("example.ai")
+        assert res["rdap_source"] == "broken"
+        assert res["cause"] == "http-500"
+        assert res["retryable"] is True
+        assert "retryable" in res["reason"].lower()
+
+    def test_broken_only_after_redirector_also_fails(self, monkeypatch):
+        # If the authoritative server has a fault but the rdap.org redirector
+        # resolves to a working server, we return that real data — NOT 'broken'.
+        # 'broken' is reserved for when both paths are exhausted.
+        def fake(url, headers=None, timeout=15.0, retries=3):
+            if "data.iana.org" in url:
+                return load_fixture("rdap_bootstrap_dns.json")
+            if "identitydigital" in url:
+                raise _cert_neterr()          # authoritative bad cert...
+            if "rdap.org" in url:
+                return load_fixture("rdap_domain_example.json")  # ...redirector rescues
+            raise AssertionError("unexpected url: " + url)
+
+        monkeypatch.setattr(recon, "http_get_json", fake)
+        res = recon.fetch_rdap("example.ai")
+        assert res["rdap_source"] == "rdap.org"
+        assert res["supported"] is True
+
+    def test_broken_is_distinct_from_unsupported_and_unreachable(self, monkeypatch):
+        # Guard the whole point: a broken endpoint must never reuse the
+        # 'supported: false / rdap_source: none' shape (no server) nor the
+        # 'unreachable' label (transport reset).
+        def fake(url, headers=None, timeout=15.0, retries=3):
+            if "data.iana.org" in url:
+                return load_fixture("rdap_bootstrap_dns.json")
+            if "identitydigital" in url or "rdap.org" in url:
+                raise _cert_neterr()
+            raise AssertionError("unexpected url: " + url)
+
+        monkeypatch.setattr(recon, "http_get_json", fake)
+        res = recon.fetch_rdap("example.ai")
+        assert not (res["supported"] is False)
+        assert res["rdap_source"] not in ("none", "unreachable")
+
+    def test_authoritative_parse_error_still_falls_back_to_rdap_org(self, monkeypatch):
+        # A non-classifiable failure (e.g. malformed JSON) is NOT 'broken' — it
+        # should still try the redirector. Keeps the trigger narrow.
+        urls = []
+
+        def fake(url, headers=None, timeout=15.0, retries=3):
+            urls.append(url)
+            if "data.iana.org" in url:
+                return load_fixture("rdap_bootstrap_dns.json")
+            if "identitydigital" in url:
+                raise recon.ParseError("invalid JSON")
+            if "rdap.org" in url:
+                return load_fixture("rdap_domain_example.json")
+            raise AssertionError("unexpected url: " + url)
+
+        monkeypatch.setattr(recon, "http_get_json", fake)
+        res = recon.fetch_rdap("example.ai")
+        assert res["rdap_source"] == "rdap.org"
+        assert res["supported"] is True
+        assert any("rdap.org/domain" in u for u in urls)
+
+    def test_builder_shape_bad_cert(self):
+        err = recon.RdapBroken(endpoint="https://rdap.nic.cr/domain/nic.cr",
+                               origin="iana-bootstrap", cause="bad-cert", retryable=False)
+        res = recon._rdap_broken("nic.cr", "domain", "nic.cr", err)
+        assert res["source"] == "rdap"
+        assert res["supported"] is True
+        assert res["rdap_source"] == "broken"
+        assert res["retryable"] is False
+        assert res["cause"] == "bad-cert"
+        assert res["tld"] == "cr"
+        assert res["endpoint"] == "https://rdap.nic.cr/domain/nic.cr"
+
+    def test_cli_exit_code_is_4_for_non_retryable_broken(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            recon, "fetch_rdap",
+            lambda *a, **k: recon._rdap_broken(
+                "example.cr", "domain", "example.cr",
+                recon.RdapBroken("https://rdap.nic.cr", "iana-bootstrap", "bad-cert", False),
+            ),
+        )
+        rc = recon.run(["rdap", "example.cr"])
+        out = capsys.readouterr().out
+        assert rc == 4
+        assert '"broken"' in out
+
+    def test_cli_exit_code_is_3_for_retryable_broken_5xx(self, monkeypatch, capsys):
+        # A retryable 5xx 'broken' shares the retryable tier (exit 3) with
+        # 'unreachable' — the actionable signal is "retry later".
+        monkeypatch.setattr(
+            recon, "fetch_rdap",
+            lambda *a, **k: recon._rdap_broken(
+                "example.tld", "domain", "example.tld",
+                recon.RdapBroken("https://rdap.example", "iana-bootstrap", "http-500", True, 500),
+            ),
+        )
+        rc = recon.run(["rdap", "example.tld"])
+        assert rc == 3
+
+    def test_human_render_broken(self):
+        err = recon.RdapBroken("https://rdap.nic.cr", "iana-bootstrap", "bad-cert", False)
+        res = recon._rdap_broken("example.cr", "domain", "example.cr", err)
+        out = recon.render_human(res)
+        assert "endpoint broken" in out
+        assert "bad-cert" in out
+        assert "— None" not in out
+
+    def test_profile_broken_rdap_is_not_an_error(self, monkeypatch):
+        resolve_map = {}
+        _install_profile_fakes(monkeypatch, resolve_map)
+        err = recon.RdapBroken("https://rdap.nic.cr", "iana-bootstrap", "bad-cert", False)
+        monkeypatch.setattr(
+            recon, "fetch_rdap",
+            lambda *a, **k: recon._rdap_broken("example.cr", "domain", "example.cr", err),
+        )
+        rep = recon.run_profile("example.cr")
+        assert rep["apex"]["rdap"]["rdap_source"] == "broken"
+        assert not any(e["step"] == "rdap" for e in rep["errors"])
+        out = recon.render_human(rep)
+        assert "rdap: broken" in out

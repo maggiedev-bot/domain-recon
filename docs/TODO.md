@@ -2,6 +2,21 @@
 
 Working notes for the recon skill. Newest priorities first.
 
+> **Status 2026-07-28 (v0.6.0):** the RDAP outcome taxonomy is now a **quint-state**.
+> On top of v0.5.0's `unreachable`, a delegated endpoint that *responds unusably*
+> (untrusted/self-signed TLS cert, or HTTP 4xx/5xx) is now the first-class
+> **`rdap_source: "broken"`** state — `cause` (`bad-cert` / `http-<status>`),
+> `http_status`, and `retryable` (false for cert/4xx, true for 5xx). Exit code by
+> retryability: **4** non-retryable (bad-cert / 4xx), **3** retryable (5xx, shared
+> with `unreachable`). The 13 former KNOWN-ISSUE TLDs were re-run one-at-a-time →
+> **12 `broken`, 1 (`.mg`) recovered to PASS**; KNOWN-ISSUE is now **0**. `broken`
+> fires only after both the authoritative server and the rdap.org redirector are
+> exhausted, and is mutually-exclusive with `unreachable` (cert-verify failure vs.
+> transport reset) — proven by an offline truth-table (suite 143 → 168 green) and
+> live re-runs (`--retries 0`, sequential). No TLS-verify disabling; pure labelling.
+> Full contract in `SKILL.md` (Exit codes); reclassification in
+> `docs/tld-target-test-results.md`.
+>
 > **Status 2026-07-27 (v0.4.0):** items #1, #2, and #3 below are **DONE**.
 > - #1 graceful degradation → `rdap` returns a first-class `unsupported`
 >   (`supported: false`, `rdap_source: "none"`) at exit 0; `profile` treats it as
@@ -71,8 +86,19 @@ spread (uk, fr, nl, ca, au all via bootstrap). Findings on the misses:
   from a different network before any supplement entry.
 
 The supplement's discipline stays: **only add endpoints verified live (200 + real
-data).** Anything unreachable/unverified is left to fall through and should be
-reported as case #3 (unsupported), never hardcoded blind.
+data).** Anything unverified is left to fall through, never hardcoded blind.
+
+> **Updated (v0.5.0):** the "unreachable" and "unsupported" cases are now
+> **distinct**. A bootstrap/supplement-delegated endpoint that resets the
+> connection / TLS-RSTs / read-times-out (errno 104 class) is reported as the
+> first-class **`rdap_source: "unreachable"` (supported:true, retryable:true, exit 3)** —
+> *the server exists, we just couldn't reach it.* Only a TLD **absent** from both
+> the bootstrap and the supplement is reported as case #3 **`unsupported`**
+> (`rdap_source: "none"`, exit 0 — no server exists). The `.eu`/`.ru` "reportedly
+> exists but unreachable (no route)" note above is the spirit of the new state,
+> though a hard no-route (`gaierror`) stays a fall-through, not `unreachable` —
+> the trigger is scoped to transport-level reset/timeout against a *delegated*
+> endpoint.
 
 ## 3. Minor
 - `rdap <domain> --human` prints `RDAP (domain) — None` when the registry omits a
